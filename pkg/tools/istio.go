@@ -1019,3 +1019,306 @@ func resolveIstioHost(host, defaultNs string) (string, string) {
 	}
 	return defaultNs, host
 }
+
+// --- analyze_istio_authpolicy ---
+
+type AnalyzeIstioAuthPolicyTool struct{ BaseTool }
+
+func (t *AnalyzeIstioAuthPolicyTool) Name() string { return "analyze_istio_authpolicy" }
+func (t *AnalyzeIstioAuthPolicyTool) Description() string {
+	return "Analyze Istio AuthorizationPolicy resources: report actions, matched workloads, rule summaries, broad deny detection, and ALLOW/DENY conflicts"
+}
+func (t *AnalyzeIstioAuthPolicyTool) InputSchema() map[string]interface{} {
+	return map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"namespace": map[string]interface{}{
+				"type":        "string",
+				"description": "Kubernetes namespace (empty for all namespaces)",
+			},
+		},
+	}
+}
+
+func (t *AnalyzeIstioAuthPolicyTool) Run(ctx context.Context, args map[string]interface{}) (*StandardResponse, error) {
+	ns := getStringArg(args, "namespace", "")
+
+	apList, err := listWithFallback(ctx, t.Clients.Dynamic, apV1GVR, apV1B1GVR, ns)
+	if err != nil {
+		return nil, &types.MCPError{
+			Code:    types.ErrCodeCRDNotAvailable,
+			Tool:    t.Name(),
+			Message: "failed to list AuthorizationPolicy",
+			Detail:  fmt.Sprintf("tried security.istio.io v1 and v1beta1: %v", err),
+		}
+	}
+
+	var findings []types.DiagnosticFinding
+
+	// Track policies by selector key for conflict detection.
+	// key: sorted "label=value,..." string (empty string = namespace-wide)
+	type policyEntry struct {
+		action    string
+		namespace string
+		name      string
+	}
+	selectorPolicies := make(map[string][]policyEntry)
+
+	for _, item := range apList.Items {
+		apNs := item.GetNamespace()
+		apName := item.GetName()
+		ref := &types.ResourceRef{
+			Kind:       "AuthorizationPolicy",
+			Namespace:  apNs,
+			Name:       apName,
+			APIVersion: "security.istio.io",
+		}
+
+		action, _, _ := unstructured.NestedString(item.Object, "spec", "action")
+		if action == "" {
+			action = "ALLOW"
+		}
+		rules, _, _ := unstructured.NestedSlice(item.Object, "spec", "rules")
+		selector, _, _ := unstructured.NestedMap(item.Object, "spec", "selector", "matchLabels")
+
+		// Build selector key
+		selectorKey := authPolicySelectorKey(selector)
+		selectorPolicies[selectorKey] = append(selectorPolicies[selectorKey], policyEntry{
+			action:    action,
+			namespace: apNs,
+			name:      apName,
+		})
+
+		// Build scope description
+		scope := "namespace-wide"
+		if len(selector) > 0 {
+			labelParts := make([]string, 0, len(selector))
+			for k, v := range selector {
+				if vs, ok := v.(string); ok {
+					labelParts = append(labelParts, fmt.Sprintf("%s=%s", k, vs))
+				}
+			}
+			sort.Strings(labelParts)
+			scope = fmt.Sprintf("selector={%s}", strings.Join(labelParts, ", "))
+		}
+
+		// Build rule summaries
+		ruleSummaries := authPolicyRuleSummaries(rules)
+
+		summary := fmt.Sprintf("AuthorizationPolicy %s/%s action=%s rules=%d (%s)", apNs, apName, action, len(rules), scope)
+		detail := ""
+		if len(ruleSummaries) > 0 {
+			detail = strings.Join(ruleSummaries, "\n")
+		}
+
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: types.SeverityInfo,
+			Category: types.CategoryPolicy,
+			Resource: ref,
+			Summary:  summary,
+			Detail:   detail,
+		})
+
+		// Detect broad DENY: DENY action with no rules = deny all traffic
+		if action == "DENY" && len(rules) == 0 {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity:   types.SeverityCritical,
+				Category:   types.CategoryPolicy,
+				Resource:   ref,
+				Summary:    fmt.Sprintf("AuthorizationPolicy %s/%s is a blanket DENY with no rules — blocks ALL traffic (%s)", apNs, apName, scope),
+				Detail:     "A DENY policy with no rules matches all requests. This will block all traffic to the targeted workloads.",
+				Suggestion: "Add specific rules to narrow the deny scope, or remove this policy if it was created in error",
+			})
+		}
+
+		// Detect broad DENY: DENY with rules that have no constraints
+		if action == "DENY" && len(rules) > 0 {
+			for ri, rule := range rules {
+				ruleMap, ok := rule.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if isUnconstrainedRule(ruleMap) {
+					findings = append(findings, types.DiagnosticFinding{
+						Severity:   types.SeverityWarning,
+						Category:   types.CategoryPolicy,
+						Resource:   ref,
+						Summary:    fmt.Sprintf("AuthorizationPolicy %s/%s DENY rule[%d] has no from/to/when constraints — matches all traffic", apNs, apName, ri),
+						Suggestion: "Add from, to, or when conditions to narrow the deny rule scope",
+					})
+				}
+			}
+		}
+
+		// Detect ALLOW with no rules — effectively denies all traffic (allowlist with empty list)
+		if action == "ALLOW" && len(rules) == 0 {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity:   types.SeverityWarning,
+				Category:   types.CategoryPolicy,
+				Resource:   ref,
+				Summary:    fmt.Sprintf("AuthorizationPolicy %s/%s is ALLOW with no rules — effectively denies all traffic (%s)", apNs, apName, scope),
+				Detail:     "An ALLOW policy with no rules means no requests are explicitly allowed. Combined with Istio's deny-by-default when any ALLOW policy exists, this blocks all traffic.",
+				Suggestion: "Add rules to specify which traffic should be allowed, or remove this policy",
+			})
+		}
+	}
+
+	// Conflict detection: ALLOW and DENY policies targeting the same workload selector
+	for selectorKey, policies := range selectorPolicies {
+		if len(policies) < 2 {
+			continue
+		}
+		hasAllow := false
+		hasDeny := false
+		var allowNames, denyNames []string
+		for _, p := range policies {
+			switch p.action {
+			case "ALLOW":
+				hasAllow = true
+				allowNames = append(allowNames, p.namespace+"/"+p.name)
+			case "DENY":
+				hasDeny = true
+				denyNames = append(denyNames, p.namespace+"/"+p.name)
+			}
+		}
+		if hasAllow && hasDeny {
+			sort.Strings(allowNames)
+			sort.Strings(denyNames)
+			selectorDesc := "namespace-wide"
+			if selectorKey != "" {
+				selectorDesc = fmt.Sprintf("selector={%s}", selectorKey)
+			}
+			findings = append(findings, types.DiagnosticFinding{
+				Severity: types.SeverityWarning,
+				Category: types.CategoryPolicy,
+				Summary:  fmt.Sprintf("Conflicting ALLOW and DENY policies target the same workloads (%s)", selectorDesc),
+				Detail: fmt.Sprintf("ALLOW policies: %s\nDENY policies: %s\n"+
+					"When both ALLOW and DENY policies apply, DENY takes precedence. Ensure the ALLOW rules do not overlap with DENY rules, or traffic may be unexpectedly blocked.",
+					strings.Join(allowNames, ", "), strings.Join(denyNames, ", ")),
+				Suggestion: "Review policy rules to ensure ALLOW and DENY scopes don't unintentionally overlap",
+			})
+		}
+	}
+
+	if len(findings) == 0 {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: types.SeverityInfo,
+			Category: types.CategoryPolicy,
+			Summary:  "No AuthorizationPolicy resources found; Istio defaults apply (all traffic allowed)",
+		})
+	}
+
+	return NewToolResultResponse(t.Cfg, t.Name(), findings, ns, "istio"), nil
+}
+
+// authPolicySelectorKey returns a deterministic string key for a selector map.
+func authPolicySelectorKey(selector map[string]interface{}) string {
+	if len(selector) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(selector))
+	for k, v := range selector {
+		if vs, ok := v.(string); ok {
+			parts = append(parts, k+"="+vs)
+		}
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
+}
+
+// authPolicyRuleSummaries returns human-readable summaries for each rule in an AuthorizationPolicy.
+func authPolicyRuleSummaries(rules []interface{}) []string {
+	summaries := make([]string, 0, len(rules))
+	for i, rule := range rules {
+		ruleMap, ok := rule.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		parts := []string{fmt.Sprintf("rule[%d]:", i)}
+
+		// Summarize "from" sources
+		if from, ok := ruleMap["from"].([]interface{}); ok && len(from) > 0 {
+			var sources []string
+			for _, f := range from {
+				if fm, ok := f.(map[string]interface{}); ok {
+					if source, ok := fm["source"].(map[string]interface{}); ok {
+						for field, val := range source {
+							if vals, ok := val.([]interface{}); ok {
+								strs := make([]string, 0, len(vals))
+								for _, v := range vals {
+									if s, ok := v.(string); ok {
+										strs = append(strs, s)
+									}
+								}
+								sources = append(sources, fmt.Sprintf("%s=[%s]", field, strings.Join(strs, ",")))
+							}
+						}
+					}
+				}
+			}
+			sort.Strings(sources)
+			parts = append(parts, "from{"+strings.Join(sources, " ")+"}")
+		}
+
+		// Summarize "to" operations
+		if to, ok := ruleMap["to"].([]interface{}); ok && len(to) > 0 {
+			var ops []string
+			for _, t := range to {
+				if tm, ok := t.(map[string]interface{}); ok {
+					if operation, ok := tm["operation"].(map[string]interface{}); ok {
+						for field, val := range operation {
+							if vals, ok := val.([]interface{}); ok {
+								strs := make([]string, 0, len(vals))
+								for _, v := range vals {
+									if s, ok := v.(string); ok {
+										strs = append(strs, s)
+									}
+								}
+								ops = append(ops, fmt.Sprintf("%s=[%s]", field, strings.Join(strs, ",")))
+							}
+						}
+					}
+				}
+			}
+			sort.Strings(ops)
+			parts = append(parts, "to{"+strings.Join(ops, " ")+"}")
+		}
+
+		// Summarize "when" conditions
+		if when, ok := ruleMap["when"].([]interface{}); ok && len(when) > 0 {
+			parts = append(parts, fmt.Sprintf("when(%d conditions)", len(when)))
+		}
+
+		summaries = append(summaries, strings.Join(parts, " "))
+	}
+	return summaries
+}
+
+// isUnconstrainedRule returns true if a rule has no from, to, or when conditions.
+func isUnconstrainedRule(rule map[string]interface{}) bool {
+	from, hasFrom := rule["from"]
+	to, hasTo := rule["to"]
+	when, hasWhen := rule["when"]
+
+	fromEmpty := !hasFrom || from == nil
+	toEmpty := !hasTo || to == nil
+	whenEmpty := !hasWhen || when == nil
+
+	if !fromEmpty {
+		if fromSlice, ok := from.([]interface{}); ok && len(fromSlice) == 0 {
+			fromEmpty = true
+		}
+	}
+	if !toEmpty {
+		if toSlice, ok := to.([]interface{}); ok && len(toSlice) == 0 {
+			toEmpty = true
+		}
+	}
+	if !whenEmpty {
+		if whenSlice, ok := when.([]interface{}); ok && len(whenSlice) == 0 {
+			whenEmpty = true
+		}
+	}
+
+	return fromEmpty && toEmpty && whenEmpty
+}
