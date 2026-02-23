@@ -2,6 +2,7 @@ package tools
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -13,11 +14,21 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/isitobservable/k8s-networking-mcp/pkg/k8s"
+	"github.com/isitobservable/k8s-networking-mcp/pkg/types"
 )
+
+const maxLogBytes = 102400 // 100KB
 
 var proxyContainerNames = []string{"istio-proxy", "envoy", "linkerd-proxy"}
 
 var errorPatterns = regexp.MustCompile(`(?i)(error|warn|rate.?limit|429|503|connection refused|TLS|timeout|denied|RBAC|misconfigur|failed|upstream.?reset|no.?healthy|circuit.?break|overflow|rejected)`)
+
+// logResult holds the result of a log fetch with truncation metadata.
+type logResult struct {
+	logs          string
+	truncated     bool
+	returnedLines int
+}
 
 // --- get_proxy_logs ---
 
@@ -53,22 +64,44 @@ func (t *GetProxyLogsTool) Run(ctx context.Context, args map[string]interface{})
 		}
 		container = findProxyContainer(pod)
 		if container == "" {
-			return nil, fmt.Errorf("no proxy container found in pod %s/%s", ns, podName)
+			return nil, &types.MCPError{
+				Code:    types.ErrCodeInvalidInput,
+				Tool:    t.Name(),
+				Message: fmt.Sprintf("no proxy sidecar container found in pod %s/%s", ns, podName),
+				Detail:  fmt.Sprintf("looked for containers named: %s", strings.Join(proxyContainerNames, ", ")),
+			}
 		}
 	}
 
-	logs, err := getPodLogs(ctx, t.Clients, ns, podName, container, int64(tail), since)
+	result, err := getPodLogs(ctx, t.Clients, ns, podName, container, int64(tail), since)
 	if err != nil {
 		return nil, err
 	}
 
-	return NewResponse(t.Cfg, t.Name(), map[string]interface{}{
-		"pod":       podName,
-		"namespace": ns,
-		"container": container,
-		"lineCount": len(strings.Split(strings.TrimSpace(logs), "\n")),
-		"logs":      logs,
-	}), nil
+	findings := []types.DiagnosticFinding{
+		{
+			Severity: types.SeverityInfo,
+			Category: types.CategoryLogs,
+			Resource: &types.ResourceRef{
+				Kind:      "Pod",
+				Namespace: ns,
+				Name:      podName,
+			},
+			Summary: fmt.Sprintf("Retrieved %d log lines from %s/%s container %s", result.returnedLines, ns, podName, container),
+			Detail:  result.logs,
+		},
+	}
+
+	if result.truncated {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity:   types.SeverityWarning,
+			Category:   types.CategoryLogs,
+			Summary:    fmt.Sprintf("Log output truncated at 100KB limit for %s/%s container %s", ns, podName, container),
+			Suggestion: "Use a smaller --tail value or narrower --since window to avoid truncation",
+		})
+	}
+
+	return NewToolResultResponse(t.Cfg, t.Name(), findings, ns, ""), nil
 }
 
 // --- get_gateway_logs ---
@@ -122,7 +155,7 @@ func (t *GetGatewayLogsTool) Run(ctx context.Context, args map[string]interface{
 
 		for _, pod := range pods.Items {
 			container := pod.Spec.Containers[0].Name
-			logs, err := getPodLogs(ctx, t.Clients, pod.Namespace, pod.Name, container, int64(tail), since)
+			lr, err := getPodLogs(ctx, t.Clients, pod.Namespace, pod.Name, container, int64(tail), since)
 			if err != nil {
 				continue
 			}
@@ -131,7 +164,7 @@ func (t *GetGatewayLogsTool) Run(ctx context.Context, args map[string]interface{
 				"namespace":   pod.Namespace,
 				"container":   container,
 				"description": gl.desc,
-				"logs":        logs,
+				"logs":        lr.logs,
 			})
 		}
 	}
@@ -215,7 +248,7 @@ func (t *GetInfraLogsTool) Run(ctx context.Context, args map[string]interface{})
 	results := make([]map[string]interface{}, 0, len(pods.Items))
 	for _, pod := range pods.Items {
 		container := pod.Spec.Containers[0].Name
-		logs, err := getPodLogs(ctx, t.Clients, ns, pod.Name, container, int64(tail), since)
+		lr, err := getPodLogs(ctx, t.Clients, ns, pod.Name, container, int64(tail), since)
 		if err != nil {
 			continue
 		}
@@ -224,7 +257,7 @@ func (t *GetInfraLogsTool) Run(ctx context.Context, args map[string]interface{})
 			"namespace": ns,
 			"container": container,
 			"node":      pod.Spec.NodeName,
-			"logs":      logs,
+			"logs":      lr.logs,
 		})
 	}
 
@@ -276,14 +309,14 @@ func (t *AnalyzeLogErrorsTool) Run(ctx context.Context, args map[string]interfac
 		}
 	}
 
-	logs, err := getPodLogs(ctx, t.Clients, ns, podName, container, int64(tail), since)
+	lr, err := getPodLogs(ctx, t.Clients, ns, podName, container, int64(tail), since)
 	if err != nil {
 		return nil, err
 	}
 
 	// Filter for error patterns
 	errorLines := make([]string, 0)
-	scanner := bufio.NewScanner(strings.NewReader(logs))
+	scanner := bufio.NewScanner(strings.NewReader(lr.logs))
 	for scanner.Scan() {
 		line := scanner.Text()
 		if errorPatterns.MatchString(line) {
@@ -349,7 +382,7 @@ func findProxyContainer(pod *corev1.Pod) string {
 	return ""
 }
 
-func getPodLogs(ctx context.Context, clients *k8s.Clients, namespace, podName, container string, tailLines int64, since string) (string, error) {
+func getPodLogs(ctx context.Context, clients *k8s.Clients, namespace, podName, container string, tailLines int64, since string) (*logResult, error) {
 	opts := &corev1.PodLogOptions{
 		Container: container,
 		TailLines: &tailLines,
@@ -366,16 +399,31 @@ func getPodLogs(ctx context.Context, clients *k8s.Clients, namespace, podName, c
 	req := clients.Clientset.CoreV1().Pods(namespace).GetLogs(podName, opts)
 	stream, err := req.Stream(ctx)
 	if err != nil {
-		return "", fmt.Errorf("failed to get logs for %s/%s/%s: %w", namespace, podName, container, err)
+		return nil, fmt.Errorf("failed to get logs for %s/%s/%s: %w", namespace, podName, container, err)
 	}
 	defer stream.Close()
 
-	buf := new(strings.Builder)
-	_, err = io.Copy(buf, stream)
+	// Read up to maxLogBytes+1 to detect truncation
+	data, err := io.ReadAll(io.LimitReader(stream, maxLogBytes+1))
 	if err != nil {
-		return "", fmt.Errorf("failed to read log stream: %w", err)
+		return nil, fmt.Errorf("failed to read log stream: %w", err)
 	}
 
-	return buf.String(), nil
-}
+	truncated := len(data) > maxLogBytes
+	if truncated {
+		data = data[:maxLogBytes]
+	}
 
+	logs := string(data)
+	lineCount := bytes.Count(data, []byte("\n"))
+	// Account for a final line without trailing newline
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		lineCount++
+	}
+
+	return &logResult{
+		logs:          logs,
+		truncated:     truncated,
+		returnedLines: lineCount,
+	}, nil
+}
