@@ -70,7 +70,7 @@ func main() {
 
 	// Gateway API tool names for conditional registration
 	gatewayToolNames := []string{"list_gateways", "get_gateway", "list_httproutes", "get_httproute", "list_grpcroutes", "get_grpcroute", "list_referencegrants", "get_referencegrant", "scan_gateway_misconfigs", "check_gateway_conformance"}
-	istioToolNames := []string{"list_istio_resources", "get_istio_resource", "check_sidecar_injection", "check_istio_mtls", "validate_istio_config", "analyze_istio_authpolicy"}
+	istioToolNames := []string{"list_istio_resources", "get_istio_resource", "check_sidecar_injection", "check_istio_mtls", "validate_istio_config", "analyze_istio_authpolicy", "analyze_istio_routing"}
 
 	// CRD discovery with onChange callback
 	disc := discovery.New(clients.Discovery, clients.Dynamic, func(features discovery.Features) {
@@ -101,6 +101,7 @@ func main() {
 			registry.Register(&tools.CheckIstioMTLSTool{BaseTool: base})
 			registry.Register(&tools.ValidateIstioConfigTool{BaseTool: base})
 			registry.Register(&tools.AnalyzeIstioAuthPolicyTool{BaseTool: base})
+			registry.Register(&tools.AnalyzeIstioRoutingTool{BaseTool: base})
 		} else {
 			for _, name := range istioToolNames {
 				registry.Unregister(name)

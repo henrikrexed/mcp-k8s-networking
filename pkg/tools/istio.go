@@ -1294,6 +1294,485 @@ func authPolicyRuleSummaries(rules []interface{}) []string {
 	return summaries
 }
 
+// --- analyze_istio_routing ---
+
+type AnalyzeIstioRoutingTool struct{ BaseTool }
+
+func (t *AnalyzeIstioRoutingTool) Name() string { return "analyze_istio_routing" }
+func (t *AnalyzeIstioRoutingTool) Description() string {
+	return "Analyze Istio traffic routing end-to-end for a service: VirtualService routes, DestinationRule subsets, service endpoints, weight sums, shadowed rules, and AuthorizationPolicy deny conflicts"
+}
+func (t *AnalyzeIstioRoutingTool) InputSchema() map[string]interface{} {
+	return map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"service": map[string]interface{}{
+				"type":        "string",
+				"description": "Kubernetes Service name to analyze routing for",
+			},
+			"namespace": map[string]interface{}{
+				"type":        "string",
+				"description": "Kubernetes namespace",
+			},
+		},
+		"required": []string{"service", "namespace"},
+	}
+}
+
+func (t *AnalyzeIstioRoutingTool) Run(ctx context.Context, args map[string]interface{}) (*StandardResponse, error) {
+	svcName := getStringArg(args, "service", "")
+	ns := getStringArg(args, "namespace", "default")
+
+	if svcName == "" {
+		return nil, &types.MCPError{
+			Code:    types.ErrCodeInvalidInput,
+			Tool:    t.Name(),
+			Message: "service name is required",
+		}
+	}
+
+	// Verify service exists and check endpoints
+	svc, svcErr := t.Clients.Dynamic.Resource(servicesGVR).Namespace(ns).Get(ctx, svcName, metav1.GetOptions{})
+	if svcErr != nil {
+		return nil, &types.MCPError{
+			Code:    types.ErrCodeInvalidInput,
+			Tool:    t.Name(),
+			Message: fmt.Sprintf("service %s/%s not found", ns, svcName),
+			Detail:  svcErr.Error(),
+		}
+	}
+
+	var findings []types.DiagnosticFinding
+
+	svcRef := &types.ResourceRef{
+		Kind:      "Service",
+		Namespace: ns,
+		Name:      svcName,
+	}
+
+	// Check endpoints
+	ep, epErr := t.Clients.Dynamic.Resource(endpointsGVR).Namespace(ns).Get(ctx, svcName, metav1.GetOptions{})
+	readyAddresses := 0
+	if epErr == nil {
+		subsets, _, _ := unstructured.NestedSlice(ep.Object, "subsets")
+		for _, s := range subsets {
+			if sm, ok := s.(map[string]interface{}); ok {
+				if addrs, ok := sm["addresses"].([]interface{}); ok {
+					readyAddresses += len(addrs)
+				}
+			}
+		}
+	}
+	if readyAddresses == 0 {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity:   types.SeverityWarning,
+			Category:   types.CategoryRouting,
+			Resource:   svcRef,
+			Summary:    fmt.Sprintf("Service %s/%s has 0 ready endpoints", ns, svcName),
+			Suggestion: "Check that pods matching the service selector are running and ready",
+		})
+	} else {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: types.SeverityInfo,
+			Category: types.CategoryRouting,
+			Resource: svcRef,
+			Summary:  fmt.Sprintf("Service %s/%s has %d ready endpoint(s)", ns, svcName, readyAddresses),
+		})
+	}
+
+	// Fetch VirtualServices in namespace
+	vsList, vsErr := listWithFallback(ctx, t.Clients.Dynamic, vsV1GVR, vsV1B1GVR, ns)
+	if vsErr != nil {
+		return nil, &types.MCPError{
+			Code:    types.ErrCodeCRDNotAvailable,
+			Tool:    t.Name(),
+			Message: "failed to list VirtualService",
+			Detail:  fmt.Sprintf("tried networking.istio.io v1 and v1beta1: %v", vsErr),
+		}
+	}
+
+	// Fetch DestinationRules in namespace
+	drList, drErr := listWithFallback(ctx, t.Clients.Dynamic, drV1GVR, drV1B1GVR, ns)
+	if drErr != nil {
+		return nil, &types.MCPError{
+			Code:    types.ErrCodeCRDNotAvailable,
+			Tool:    t.Name(),
+			Message: "failed to list DestinationRule",
+			Detail:  fmt.Sprintf("tried networking.istio.io v1 and v1beta1: %v", drErr),
+		}
+	}
+
+	// Find VirtualServices that reference this service
+	matchingVS := filterVSForService(vsList, svcName, ns)
+	if len(matchingVS) == 0 {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: types.SeverityInfo,
+			Category: types.CategoryRouting,
+			Resource: svcRef,
+			Summary:  fmt.Sprintf("No VirtualService routes traffic to %s/%s — default Kubernetes routing applies", ns, svcName),
+		})
+	}
+
+	// Find DestinationRule for this service
+	var matchingDR *unstructured.Unstructured
+	for i, dr := range drList.Items {
+		drHost, _, _ := unstructured.NestedString(dr.Object, "spec", "host")
+		_, drSvc := resolveIstioHost(drHost, dr.GetNamespace())
+		if drSvc == svcName {
+			matchingDR = &drList.Items[i]
+			break
+		}
+	}
+
+	// Collect defined subsets from the DestinationRule
+	definedSubsets := make(map[string]bool)
+	if matchingDR != nil {
+		subsets, _, _ := unstructured.NestedSlice(matchingDR.Object, "spec", "subsets")
+		for _, s := range subsets {
+			if sm, ok := s.(map[string]interface{}); ok {
+				if name, _ := sm["name"].(string); name != "" {
+					definedSubsets[name] = true
+				}
+			}
+		}
+		drRef := &types.ResourceRef{
+			Kind:       "DestinationRule",
+			Namespace:  matchingDR.GetNamespace(),
+			Name:       matchingDR.GetName(),
+			APIVersion: "networking.istio.io",
+		}
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: types.SeverityInfo,
+			Category: types.CategoryRouting,
+			Resource: drRef,
+			Summary:  fmt.Sprintf("DestinationRule %s/%s defines %d subset(s) for %s", matchingDR.GetNamespace(), matchingDR.GetName(), len(definedSubsets), svcName),
+		})
+	}
+
+	// Analyze each matching VirtualService
+	for _, vs := range matchingVS {
+		vsRef := &types.ResourceRef{
+			Kind:       "VirtualService",
+			Namespace:  vs.GetNamespace(),
+			Name:       vs.GetName(),
+			APIVersion: "networking.istio.io",
+		}
+
+		httpRoutes, _, _ := unstructured.NestedSlice(vs.Object, "spec", "http")
+
+		// Track match signatures to detect shadowed routes
+		var seenCatchAll bool
+
+		for ri, route := range httpRoutes {
+			routeMap, ok := route.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			matches, _, _ := unstructured.NestedSlice(routeMap, "match")
+			isCatchAll := len(matches) == 0
+
+			// Shadowed route detection: any route after a catch-all is unreachable
+			if seenCatchAll {
+				findings = append(findings, types.DiagnosticFinding{
+					Severity:   types.SeverityWarning,
+					Category:   types.CategoryRouting,
+					Resource:   vsRef,
+					Summary:    fmt.Sprintf("VirtualService %s/%s http route[%d] is unreachable — shadowed by a catch-all route above it", vs.GetNamespace(), vs.GetName(), ri),
+					Detail:     "A previous route has no match conditions and matches all requests. This route will never be evaluated.",
+					Suggestion: "Reorder routes so specific matches come before catch-all routes",
+				})
+			}
+
+			// Detect prefix-shadowed routes: a broader prefix match before a narrower one
+			if !isCatchAll && !seenCatchAll {
+				findings = append(findings, t.detectShadowedMatches(vs, httpRoutes, ri, matches)...)
+			}
+
+			if isCatchAll {
+				seenCatchAll = true
+			}
+
+			// Analyze route destinations
+			routeDests, _, _ := unstructured.NestedSlice(routeMap, "route")
+			totalWeight := 0
+			hasExplicitWeight := false
+
+			for di, dest := range routeDests {
+				destMap, ok := dest.(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				destHost, _, _ := unstructured.NestedString(destMap, "destination", "host")
+				destSubset, _, _ := unstructured.NestedString(destMap, "destination", "subset")
+				weight, weightFound, _ := unstructured.NestedFloat64(destMap, "weight")
+
+				if weightFound {
+					hasExplicitWeight = true
+					totalWeight += int(weight)
+				}
+
+				// Check if destination host resolves to our target service or another
+				_, destSvc := resolveIstioHost(destHost, ns)
+				if destSvc == svcName {
+					// Check subset existence
+					if destSubset != "" && !definedSubsets[destSubset] {
+						findings = append(findings, types.DiagnosticFinding{
+							Severity: types.SeverityCritical,
+							Category: types.CategoryRouting,
+							Resource: vsRef,
+							Summary:  fmt.Sprintf("VirtualService %s/%s route[%d].route[%d] references non-existent subset %q for %s", vs.GetNamespace(), vs.GetName(), ri, di, destSubset, svcName),
+							Detail: func() string {
+								if matchingDR == nil {
+									return fmt.Sprintf("No DestinationRule found for host %s — subset references cannot be resolved", svcName)
+								}
+								names := make([]string, 0, len(definedSubsets))
+								for n := range definedSubsets {
+									names = append(names, n)
+								}
+								sort.Strings(names)
+								return fmt.Sprintf("Available subsets in DestinationRule: [%s]", strings.Join(names, ", "))
+							}(),
+							Suggestion: "Create the subset in the DestinationRule or correct the subset name",
+						})
+					}
+
+					// If subset required but no DR exists
+					if destSubset != "" && matchingDR == nil {
+						findings = append(findings, types.DiagnosticFinding{
+							Severity:   types.SeverityCritical,
+							Category:   types.CategoryRouting,
+							Resource:   vsRef,
+							Summary:    fmt.Sprintf("VirtualService %s/%s route[%d].route[%d] references subset %q but no DestinationRule exists for %s", vs.GetNamespace(), vs.GetName(), ri, di, destSubset, svcName),
+							Suggestion: "Create a DestinationRule with subset definitions for this service",
+						})
+					}
+				}
+			}
+
+			// Weight sum validation
+			if hasExplicitWeight && len(routeDests) > 1 && totalWeight != 100 {
+				findings = append(findings, types.DiagnosticFinding{
+					Severity:   types.SeverityCritical,
+					Category:   types.CategoryRouting,
+					Resource:   vsRef,
+					Summary:    fmt.Sprintf("VirtualService %s/%s http route[%d] weight sum is %d (must be 100)", vs.GetNamespace(), vs.GetName(), ri, totalWeight),
+					Suggestion: "Adjust route destination weights to sum to exactly 100",
+				})
+			}
+		}
+	}
+
+	// Check for AuthorizationPolicy DENY conflicts
+	findings = append(findings, t.checkAuthPolicyConflicts(ctx, svc, svcName, ns)...)
+
+	if len(findings) == 0 {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: types.SeverityOK,
+			Category: types.CategoryRouting,
+			Summary:  fmt.Sprintf("Routing analysis for %s/%s found no issues", ns, svcName),
+		})
+	}
+
+	return NewToolResultResponse(t.Cfg, t.Name(), findings, ns, "istio"), nil
+}
+
+// filterVSForService returns VirtualServices whose HTTP or TCP route destinations reference the given service.
+func filterVSForService(vsList *unstructured.UnstructuredList, svcName, ns string) []*unstructured.Unstructured {
+	var result []*unstructured.Unstructured
+	for i, vs := range vsList.Items {
+		if vsReferencesService(&vs, svcName, ns) {
+			result = append(result, &vsList.Items[i])
+		}
+	}
+	return result
+}
+
+// vsReferencesService checks if a VirtualService has any route destination targeting the given service.
+func vsReferencesService(vs *unstructured.Unstructured, svcName, ns string) bool {
+	for _, routeType := range []string{"http", "tcp", "tls"} {
+		routes, _, _ := unstructured.NestedSlice(vs.Object, "spec", routeType)
+		for _, route := range routes {
+			routeMap, ok := route.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			dests, _, _ := unstructured.NestedSlice(routeMap, "route")
+			for _, dest := range dests {
+				destMap, ok := dest.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				destHost, _, _ := unstructured.NestedString(destMap, "destination", "host")
+				_, destSvc := resolveIstioHost(destHost, vs.GetNamespace())
+				if destSvc == svcName {
+					return true
+				}
+			}
+		}
+	}
+
+	// Also check spec.hosts for the service name
+	hosts, _, _ := unstructured.NestedStringSlice(vs.Object, "spec", "hosts")
+	for _, h := range hosts {
+		_, hostSvc := resolveIstioHost(h, vs.GetNamespace())
+		if hostSvc == svcName {
+			return true
+		}
+	}
+
+	return false
+}
+
+// detectShadowedMatches checks if route[ri] is shadowed by a broader match in a preceding route.
+func (t *AnalyzeIstioRoutingTool) detectShadowedMatches(vs *unstructured.Unstructured, httpRoutes []interface{}, ri int, currentMatches []interface{}) []types.DiagnosticFinding {
+	var findings []types.DiagnosticFinding
+	vsRef := &types.ResourceRef{
+		Kind:       "VirtualService",
+		Namespace:  vs.GetNamespace(),
+		Name:       vs.GetName(),
+		APIVersion: "networking.istio.io",
+	}
+
+	for pi := 0; pi < ri; pi++ {
+		prevRoute, ok := httpRoutes[pi].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		prevMatches, _, _ := unstructured.NestedSlice(prevRoute, "match")
+		if len(prevMatches) == 0 {
+			// Already handled by catch-all detection
+			continue
+		}
+
+		// Check URI prefix shadowing: if a previous route has a shorter or equal prefix
+		// that covers the current route's prefix
+		for _, cm := range currentMatches {
+			cmMap, ok := cm.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			curPrefix := extractMatchPrefix(cmMap)
+			if curPrefix == "" {
+				continue
+			}
+			for _, pm := range prevMatches {
+				pmMap, ok := pm.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				prevPrefix := extractMatchPrefix(pmMap)
+				if prevPrefix == "" {
+					continue
+				}
+				if prevPrefix != curPrefix && strings.HasPrefix(curPrefix, prevPrefix) {
+					findings = append(findings, types.DiagnosticFinding{
+						Severity: types.SeverityWarning,
+						Category: types.CategoryRouting,
+						Resource: vsRef,
+						Summary:  fmt.Sprintf("VirtualService %s/%s http route[%d] prefix %q may be shadowed by route[%d] prefix %q", vs.GetNamespace(), vs.GetName(), ri, curPrefix, pi, prevPrefix),
+						Detail:   fmt.Sprintf("Route[%d] matches prefix %q which is a superset of route[%d] prefix %q. The broader route will match first.", pi, prevPrefix, ri, curPrefix),
+						Suggestion: "Reorder routes so more specific prefixes come before broader ones",
+					})
+				}
+			}
+		}
+	}
+
+	return findings
+}
+
+// extractMatchPrefix extracts the URI prefix from an HTTP match condition.
+func extractMatchPrefix(match map[string]interface{}) string {
+	uri, ok := match["uri"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	if prefix, ok := uri["prefix"].(string); ok {
+		return prefix
+	}
+	return ""
+}
+
+// checkAuthPolicyConflicts checks if any DENY AuthorizationPolicy targets this service's workloads.
+func (t *AnalyzeIstioRoutingTool) checkAuthPolicyConflicts(ctx context.Context, svc *unstructured.Unstructured, svcName, ns string) []types.DiagnosticFinding {
+	apList, err := listWithFallback(ctx, t.Clients.Dynamic, apV1GVR, apV1B1GVR, ns)
+	if err != nil {
+		// Non-fatal — just skip AuthorizationPolicy analysis
+		slog.Debug("analyze_istio_routing: skipping AuthorizationPolicy check", "error", err)
+		return nil
+	}
+
+	// Get service selector to match against AP workload selectors
+	svcSelector, _, _ := unstructured.NestedStringMap(svc.Object, "spec", "selector")
+	if len(svcSelector) == 0 {
+		return nil
+	}
+
+	var findings []types.DiagnosticFinding
+
+	for _, ap := range apList.Items {
+		action, _, _ := unstructured.NestedString(ap.Object, "spec", "action")
+		if action != "DENY" {
+			continue
+		}
+
+		apSelector, _, _ := unstructured.NestedMap(ap.Object, "spec", "selector", "matchLabels")
+
+		// Namespace-wide DENY (no selector) affects all services
+		if len(apSelector) == 0 {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity: types.SeverityWarning,
+				Category: types.CategoryRouting,
+				Resource: &types.ResourceRef{
+					Kind:       "AuthorizationPolicy",
+					Namespace:  ap.GetNamespace(),
+					Name:       ap.GetName(),
+					APIVersion: "security.istio.io",
+				},
+				Summary: fmt.Sprintf("Namespace-wide DENY AuthorizationPolicy %s/%s may block traffic to %s", ap.GetNamespace(), ap.GetName(), svcName),
+				Detail:  "This DENY policy has no workload selector and applies to all services in the namespace. Routed traffic may be denied.",
+				Suggestion: "Verify the DENY policy rules don't overlap with traffic routed to this service",
+			})
+			continue
+		}
+
+		// Check if AP selector labels are a subset of the service's selector
+		if selectorOverlaps(svcSelector, apSelector) {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity: types.SeverityWarning,
+				Category: types.CategoryRouting,
+				Resource: &types.ResourceRef{
+					Kind:       "AuthorizationPolicy",
+					Namespace:  ap.GetNamespace(),
+					Name:       ap.GetName(),
+					APIVersion: "security.istio.io",
+				},
+				Summary: fmt.Sprintf("DENY AuthorizationPolicy %s/%s targets workloads that overlap with service %s", ap.GetNamespace(), ap.GetName(), svcName),
+				Detail:  "The AuthorizationPolicy workload selector matches pods selected by this service. Routed traffic may be denied by this policy.",
+				Suggestion: "Review the DENY rules to ensure they don't block expected traffic to this service",
+			})
+		}
+	}
+
+	return findings
+}
+
+// selectorOverlaps returns true if all labels in apSelector match labels in svcSelector.
+func selectorOverlaps(svcSelector map[string]string, apSelector map[string]interface{}) bool {
+	for k, v := range apSelector {
+		vs, ok := v.(string)
+		if !ok {
+			continue
+		}
+		if svcSelector[k] != vs {
+			return false
+		}
+	}
+	return true
+}
+
 // isUnconstrainedRule returns true if a rule has no from, to, or when conditions.
 func isUnconstrainedRule(rule map[string]interface{}) bool {
 	from, hasFrom := rule["from"]
