@@ -1235,6 +1235,335 @@ func (t *GetReferenceGrantTool) Run(ctx context.Context, args map[string]interfa
 	return NewToolResultResponse(t.Cfg, t.Name(), findings, ns, "gateway-api"), nil
 }
 
+// --- scan_gateway_misconfigs ---
+
+type ScanGatewayMisconfigsTool struct{ BaseTool }
+
+func (t *ScanGatewayMisconfigsTool) Name() string { return "scan_gateway_misconfigs" }
+func (t *ScanGatewayMisconfigsTool) Description() string {
+	return "Scan for Gateway API misconfigurations: missing backends, orphaned routes, missing ReferenceGrants, listener conflicts"
+}
+func (t *ScanGatewayMisconfigsTool) InputSchema() map[string]interface{} {
+	return map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"namespace": map[string]interface{}{
+				"type":        "string",
+				"description": "Kubernetes namespace (empty for cluster-wide scan)",
+			},
+		},
+	}
+}
+
+func (t *ScanGatewayMisconfigsTool) Run(ctx context.Context, args map[string]interface{}) (*StandardResponse, error) {
+	ns := getStringArg(args, "namespace", "")
+
+	// Fetch all resources
+	gwList, _ := listWithFallback(ctx, t.Clients.Dynamic, gatewaysV1GVR, gatewaysV1B1GVR, ns)
+	httpRouteList, _ := listWithFallback(ctx, t.Clients.Dynamic, httpRoutesV1GVR, httpRoutesV1B1GVR, ns)
+	grpcRouteList, _ := listWithFallback(ctx, t.Clients.Dynamic, grpcRoutesV1GVR, grpcRoutesV1B1GVR, ns)
+	refGrantList, _ := listWithFallback(ctx, t.Clients.Dynamic, refGrantsV1GVR, refGrantsV1B1GVR, ns)
+
+	// Build lookup maps
+	// gatewaysByKey: "namespace/name" -> gateway listeners
+	type listenerInfo struct {
+		name     string
+		port     float64
+		protocol string
+	}
+	type gatewayInfo struct {
+		listeners []listenerInfo
+	}
+	gatewaysByKey := make(map[string]*gatewayInfo)
+	if gwList != nil {
+		for _, gw := range gwList.Items {
+			key := gw.GetNamespace() + "/" + gw.GetName()
+			listeners, _, _ := unstructured.NestedSlice(gw.Object, "spec", "listeners")
+			info := &gatewayInfo{}
+			for _, l := range listeners {
+				if lm, ok := l.(map[string]interface{}); ok {
+					lName, _ := lm["name"].(string)
+					port, _ := lm["port"].(float64)
+					protocol, _ := lm["protocol"].(string)
+					info.listeners = append(info.listeners, listenerInfo{name: lName, port: port, protocol: protocol})
+				}
+			}
+			gatewaysByKey[key] = info
+		}
+	}
+
+	// refGrants: build set of allowed cross-namespace refs
+	// key: "fromNamespace/fromKind -> toNamespace" = true
+	type refGrantEntry struct {
+		fromNs   string
+		fromKind string
+		toNs     string
+	}
+	var refGrants []refGrantEntry
+	if refGrantList != nil {
+		for _, rg := range refGrantList.Items {
+			toNs := rg.GetNamespace()
+			fromRefs, _, _ := unstructured.NestedSlice(rg.Object, "spec", "from")
+			for _, f := range fromRefs {
+				if fm, ok := f.(map[string]interface{}); ok {
+					fromNs, _ := fm["namespace"].(string)
+					fromKind, _ := fm["kind"].(string)
+					refGrants = append(refGrants, refGrantEntry{fromNs: fromNs, fromKind: fromKind, toNs: toNs})
+				}
+			}
+		}
+	}
+
+	hasRefGrant := func(fromNs, fromKind, toNs string) bool {
+		for _, rg := range refGrants {
+			if rg.fromNs == fromNs && rg.toNs == toNs && (rg.fromKind == fromKind || rg.fromKind == "") {
+				return true
+			}
+		}
+		return false
+	}
+
+	var findings []types.DiagnosticFinding
+
+	// --- Check 1: Gateway listener conflicts (port/protocol collisions) ---
+	if gwList != nil {
+		for _, gw := range gwList.Items {
+			gwKey := gw.GetNamespace() + "/" + gw.GetName()
+			info := gatewaysByKey[gwKey]
+			seen := make(map[string]string) // "port" -> first listener name
+			for _, l := range info.listeners {
+				portKey := fmt.Sprintf("%v/%s", l.port, l.protocol)
+				if prev, exists := seen[portKey]; exists {
+					findings = append(findings, types.DiagnosticFinding{
+						Severity: types.SeverityWarning,
+						Category: types.CategoryRouting,
+						Resource: &types.ResourceRef{
+							Kind:       "Gateway",
+							Namespace:  gw.GetNamespace(),
+							Name:       gw.GetName(),
+							APIVersion: "gateway.networking.k8s.io",
+						},
+						Summary:    fmt.Sprintf("Gateway %s has listener conflict: %s and %s both use port %v/%s", gwKey, prev, l.name, l.port, l.protocol),
+						Suggestion: "Use different ports or merge listeners with the same port/protocol",
+					})
+				} else {
+					seen[portKey] = l.name
+				}
+			}
+		}
+	}
+
+	// Helper to scan routes for misconfigs
+	type routeInfo struct {
+		kind      string
+		name      string
+		namespace string
+		obj       map[string]interface{}
+	}
+	var allRoutes []routeInfo
+	if httpRouteList != nil {
+		for _, r := range httpRouteList.Items {
+			allRoutes = append(allRoutes, routeInfo{kind: "HTTPRoute", name: r.GetName(), namespace: r.GetNamespace(), obj: r.Object})
+		}
+	}
+	if grpcRouteList != nil {
+		for _, r := range grpcRouteList.Items {
+			allRoutes = append(allRoutes, routeInfo{kind: "GRPCRoute", name: r.GetName(), namespace: r.GetNamespace(), obj: r.Object})
+		}
+	}
+
+	for _, route := range allRoutes {
+		routeRef := &types.ResourceRef{
+			Kind:       route.kind,
+			Namespace:  route.namespace,
+			Name:       route.name,
+			APIVersion: "gateway.networking.k8s.io",
+		}
+
+		// --- Check 2: Routes attached to non-existent or non-matching Gateways ---
+		parentRefs, _, _ := unstructured.NestedSlice(route.obj, "spec", "parentRefs")
+		for _, pr := range parentRefs {
+			prm, ok := pr.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			refName, _ := prm["name"].(string)
+			refNs, _ := prm["namespace"].(string)
+			if refNs == "" {
+				refNs = route.namespace
+			}
+			gwKey := refNs + "/" + refName
+			if _, exists := gatewaysByKey[gwKey]; !exists {
+				findings = append(findings, types.DiagnosticFinding{
+					Severity:   types.SeverityWarning,
+					Category:   types.CategoryRouting,
+					Resource:   routeRef,
+					Summary:    fmt.Sprintf("%s %s/%s references non-existent gateway %s", route.kind, route.namespace, route.name, gwKey),
+					Suggestion: fmt.Sprintf("Create gateway %s or update the parentRef to an existing gateway", gwKey),
+				})
+			} else if sectionName, ok := prm["sectionName"].(string); ok && sectionName != "" {
+				gwInfo := gatewaysByKey[gwKey]
+				found := false
+				for _, l := range gwInfo.listeners {
+					if l.name == sectionName {
+						found = true
+						break
+					}
+				}
+				if !found {
+					findings = append(findings, types.DiagnosticFinding{
+						Severity:   types.SeverityWarning,
+						Category:   types.CategoryRouting,
+						Resource:   routeRef,
+						Summary:    fmt.Sprintf("%s %s/%s references non-existent listener %q on gateway %s", route.kind, route.namespace, route.name, sectionName, gwKey),
+						Suggestion: fmt.Sprintf("Check listener names on gateway %s", gwKey),
+					})
+				}
+			}
+		}
+
+		// --- Check 3 & 4: Backend service existence and cross-namespace ReferenceGrants ---
+		rules, _, _ := unstructured.NestedSlice(route.obj, "spec", "rules")
+		for _, r := range rules {
+			rm, ok := r.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			brs, ok := rm["backendRefs"].([]interface{})
+			if !ok {
+				continue
+			}
+			for _, br := range brs {
+				brm, ok := br.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				refName, _ := brm["name"].(string)
+				refNs, _ := brm["namespace"].(string)
+				if refNs == "" {
+					refNs = route.namespace
+				}
+
+				// Check 3: Non-existent backend services
+				_, svcErr := t.Clients.Dynamic.Resource(servicesGVR).Namespace(refNs).Get(ctx, refName, metav1.GetOptions{})
+				if svcErr != nil {
+					findings = append(findings, types.DiagnosticFinding{
+						Severity:   types.SeverityWarning,
+						Category:   types.CategoryRouting,
+						Resource:   routeRef,
+						Summary:    fmt.Sprintf("%s %s/%s references non-existent backend service %s/%s", route.kind, route.namespace, route.name, refNs, refName),
+						Suggestion: "Create the backend service or update the backendRef",
+					})
+				}
+
+				// Check 4: Cross-namespace references missing ReferenceGrants
+				if refNs != route.namespace {
+					if !hasRefGrant(route.namespace, route.kind, refNs) {
+						findings = append(findings, types.DiagnosticFinding{
+							Severity:   types.SeverityWarning,
+							Category:   types.CategoryPolicy,
+							Resource:   routeRef,
+							Summary:    fmt.Sprintf("%s %s/%s references backend %s/%s across namespaces but no ReferenceGrant allows this", route.kind, route.namespace, route.name, refNs, refName),
+							Suggestion: fmt.Sprintf("Create a ReferenceGrant in namespace %s allowing %s from namespace %s", refNs, route.kind, route.namespace),
+						})
+					}
+				}
+			}
+
+			// --- Check 5: Invalid filter configurations ---
+			if filters, ok := rm["filters"].([]interface{}); ok {
+				for _, f := range filters {
+					fm, ok := f.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					fType, _ := fm["type"].(string)
+					switch fType {
+					case "RequestRedirect":
+						if _, ok := fm["requestRedirect"]; !ok {
+							findings = append(findings, types.DiagnosticFinding{
+								Severity:   types.SeverityWarning,
+								Category:   types.CategoryRouting,
+								Resource:   routeRef,
+								Summary:    fmt.Sprintf("%s %s/%s has RequestRedirect filter with missing requestRedirect config", route.kind, route.namespace, route.name),
+								Suggestion: "Add requestRedirect configuration to the filter",
+							})
+						}
+					case "URLRewrite":
+						if _, ok := fm["urlRewrite"]; !ok {
+							findings = append(findings, types.DiagnosticFinding{
+								Severity:   types.SeverityWarning,
+								Category:   types.CategoryRouting,
+								Resource:   routeRef,
+								Summary:    fmt.Sprintf("%s %s/%s has URLRewrite filter with missing urlRewrite config", route.kind, route.namespace, route.name),
+								Suggestion: "Add urlRewrite configuration to the filter",
+							})
+						}
+					case "RequestHeaderModifier":
+						if _, ok := fm["requestHeaderModifier"]; !ok {
+							findings = append(findings, types.DiagnosticFinding{
+								Severity:   types.SeverityWarning,
+								Category:   types.CategoryRouting,
+								Resource:   routeRef,
+								Summary:    fmt.Sprintf("%s %s/%s has RequestHeaderModifier filter with missing requestHeaderModifier config", route.kind, route.namespace, route.name),
+								Suggestion: "Add requestHeaderModifier configuration to the filter",
+							})
+						}
+					case "ResponseHeaderModifier":
+						if _, ok := fm["responseHeaderModifier"]; !ok {
+							findings = append(findings, types.DiagnosticFinding{
+								Severity:   types.SeverityWarning,
+								Category:   types.CategoryRouting,
+								Resource:   routeRef,
+								Summary:    fmt.Sprintf("%s %s/%s has ResponseHeaderModifier filter with missing responseHeaderModifier config", route.kind, route.namespace, route.name),
+								Suggestion: "Add responseHeaderModifier configuration to the filter",
+							})
+						}
+					case "RequestMirror":
+						if _, ok := fm["requestMirror"]; !ok {
+							findings = append(findings, types.DiagnosticFinding{
+								Severity:   types.SeverityWarning,
+								Category:   types.CategoryRouting,
+								Resource:   routeRef,
+								Summary:    fmt.Sprintf("%s %s/%s has RequestMirror filter with missing requestMirror config", route.kind, route.namespace, route.name),
+								Suggestion: "Add requestMirror configuration to the filter",
+							})
+						}
+					case "ExtensionRef":
+						if _, ok := fm["extensionRef"]; !ok {
+							findings = append(findings, types.DiagnosticFinding{
+								Severity:   types.SeverityWarning,
+								Category:   types.CategoryRouting,
+								Resource:   routeRef,
+								Summary:    fmt.Sprintf("%s %s/%s has ExtensionRef filter with missing extensionRef config", route.kind, route.namespace, route.name),
+								Suggestion: "Add extensionRef configuration to the filter",
+							})
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if len(findings) == 0 {
+		responseNs := ns
+		if responseNs == "" {
+			responseNs = "all"
+		}
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: types.SeverityOK,
+			Category: types.CategoryRouting,
+			Summary:  fmt.Sprintf("No Gateway API misconfigurations detected in namespace %s", responseNs),
+		})
+	}
+
+	responseNs := ns
+	if responseNs == "" {
+		responseNs = "all"
+	}
+	return NewToolResultResponse(t.Cfg, t.Name(), findings, responseNs, "gateway-api"), nil
+}
+
 // Helper functions
 
 func formatConditions(conditions []interface{}) string {
