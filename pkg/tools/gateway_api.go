@@ -1564,6 +1564,620 @@ func (t *ScanGatewayMisconfigsTool) Run(ctx context.Context, args map[string]int
 	return NewToolResultResponse(t.Cfg, t.Name(), findings, responseNs, "gateway-api"), nil
 }
 
+// --- check_gateway_conformance ---
+
+type CheckGatewayConformanceTool struct{ BaseTool }
+
+func (t *CheckGatewayConformanceTool) Name() string { return "check_gateway_conformance" }
+func (t *CheckGatewayConformanceTool) Description() string {
+	return "Validate Gateway API resources (Gateway, HTTPRoute, GRPCRoute) against the specification and report non-conformant fields"
+}
+func (t *CheckGatewayConformanceTool) InputSchema() map[string]interface{} {
+	return map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"kind": map[string]interface{}{
+				"type":        "string",
+				"description": "Resource kind: Gateway, HTTPRoute, or GRPCRoute",
+				"enum":        []string{"Gateway", "HTTPRoute", "GRPCRoute"},
+			},
+			"name": map[string]interface{}{
+				"type":        "string",
+				"description": "Resource name",
+			},
+			"namespace": map[string]interface{}{
+				"type":        "string",
+				"description": "Kubernetes namespace",
+			},
+		},
+		"required": []string{"kind", "name", "namespace"},
+	}
+}
+
+// Valid enum values per the Gateway API specification.
+var (
+	validListenerProtocols = map[string]bool{"HTTP": true, "HTTPS": true, "TLS": true, "TCP": true, "UDP": true}
+	validTLSModes          = map[string]bool{"Terminate": true, "Passthrough": true}
+	validHTTPMethods       = map[string]bool{"GET": true, "HEAD": true, "POST": true, "PUT": true, "DELETE": true, "CONNECT": true, "OPTIONS": true, "TRACE": true, "PATCH": true}
+	validPathMatchTypes    = map[string]bool{"Exact": true, "PathPrefix": true, "RegularExpression": true}
+	validHeaderMatchTypes  = map[string]bool{"Exact": true, "RegularExpression": true}
+	validQueryMatchTypes   = map[string]bool{"Exact": true, "RegularExpression": true}
+	validHTTPFilterTypes   = map[string]bool{"RequestHeaderModifier": true, "ResponseHeaderModifier": true, "RequestMirror": true, "RequestRedirect": true, "URLRewrite": true, "ExtensionRef": true}
+	validGRPCMethodTypes   = map[string]bool{"Exact": true, "RegularExpression": true}
+	validGRPCFilterTypes   = map[string]bool{"RequestHeaderModifier": true, "ResponseHeaderModifier": true, "RequestMirror": true, "ExtensionRef": true}
+
+	// Extended conformance features (not in core profile).
+	extendedProtocols      = map[string]bool{"TLS": true, "TCP": true, "UDP": true}
+	extendedTLSModes       = map[string]bool{"Passthrough": true}
+	extendedPathMatchTypes = map[string]bool{"RegularExpression": true}
+	extendedHTTPFilters    = map[string]bool{"URLRewrite": true, "ResponseHeaderModifier": true, "RequestMirror": true}
+	extendedGRPCMethods    = map[string]bool{"RegularExpression": true}
+)
+
+func (t *CheckGatewayConformanceTool) Run(ctx context.Context, args map[string]interface{}) (*StandardResponse, error) {
+	kind := getStringArg(args, "kind", "")
+	name := getStringArg(args, "name", "")
+	ns := getStringArg(args, "namespace", "default")
+
+	if kind == "" || name == "" {
+		return nil, &types.MCPError{
+			Code:    types.ErrCodeInvalidInput,
+			Tool:    t.Name(),
+			Message: "kind and name are required",
+		}
+	}
+
+	var findings []types.DiagnosticFinding
+
+	switch kind {
+	case "Gateway":
+		findings = t.validateGateway(ctx, ns, name)
+	case "HTTPRoute":
+		findings = t.validateHTTPRoute(ctx, ns, name)
+	case "GRPCRoute":
+		findings = t.validateGRPCRoute(ctx, ns, name)
+	default:
+		return nil, &types.MCPError{
+			Code:    types.ErrCodeInvalidInput,
+			Tool:    t.Name(),
+			Message: fmt.Sprintf("unsupported kind %q; must be Gateway, HTTPRoute, or GRPCRoute", kind),
+		}
+	}
+
+	if len(findings) == 0 {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: types.SeverityOK,
+			Category: types.CategoryRouting,
+			Resource: &types.ResourceRef{
+				Kind:       kind,
+				Namespace:  ns,
+				Name:       name,
+				APIVersion: "gateway.networking.k8s.io",
+			},
+			Summary: fmt.Sprintf("%s %s/%s is conformant with the Gateway API specification (core profile)", kind, ns, name),
+		})
+	}
+
+	return NewToolResultResponse(t.Cfg, t.Name(), findings, ns, "gateway-api"), nil
+}
+
+func (t *CheckGatewayConformanceTool) validateGateway(ctx context.Context, ns, name string) []types.DiagnosticFinding {
+	gw, err := getWithFallback(ctx, t.Clients.Dynamic, gatewaysV1GVR, gatewaysV1B1GVR, ns, name)
+	if err != nil {
+		return []types.DiagnosticFinding{{
+			Severity: types.SeverityWarning,
+			Category: types.CategoryRouting,
+			Resource: &types.ResourceRef{Kind: "Gateway", Namespace: ns, Name: name, APIVersion: "gateway.networking.k8s.io"},
+			Summary:  fmt.Sprintf("Gateway %s/%s not found: %v", ns, name, err),
+		}}
+	}
+
+	ref := &types.ResourceRef{Kind: "Gateway", Namespace: ns, Name: name, APIVersion: "gateway.networking.k8s.io"}
+	var findings []types.DiagnosticFinding
+	extendedFeatures := make(map[string]bool)
+
+	// Validate gatewayClassName (required)
+	gatewayClass := getNestedString(gw.Object, "spec", "gatewayClassName")
+	if gatewayClass == "" {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity:   types.SeverityWarning,
+			Category:   types.CategoryRouting,
+			Resource:   ref,
+			Summary:    "spec.gatewayClassName is required but missing",
+			Suggestion: "Set spec.gatewayClassName to a valid GatewayClass name",
+		})
+	}
+
+	// Validate listeners
+	listeners, _, _ := unstructured.NestedSlice(gw.Object, "spec", "listeners")
+	if len(listeners) == 0 {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity:   types.SeverityWarning,
+			Category:   types.CategoryRouting,
+			Resource:   ref,
+			Summary:    "spec.listeners is required but empty or missing",
+			Suggestion: "Add at least one listener to the Gateway",
+		})
+	}
+
+	for i, l := range listeners {
+		lm, ok := l.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		lName, _ := lm["name"].(string)
+		prefix := fmt.Sprintf("spec.listeners[%d]", i)
+		if lName != "" {
+			prefix = fmt.Sprintf("spec.listeners[%d] (%s)", i, lName)
+		}
+
+		// name is required
+		if lName == "" {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity:   types.SeverityWarning,
+				Category:   types.CategoryRouting,
+				Resource:   ref,
+				Summary:    fmt.Sprintf("%s: name is required but missing", prefix),
+				Suggestion: "Set a unique name for each listener",
+			})
+		}
+
+		// protocol validation
+		protocol, _ := lm["protocol"].(string)
+		if protocol == "" {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity:   types.SeverityWarning,
+				Category:   types.CategoryRouting,
+				Resource:   ref,
+				Summary:    fmt.Sprintf("%s: protocol is required but missing", prefix),
+				Suggestion: "Set protocol to one of: HTTP, HTTPS, TLS, TCP, UDP",
+			})
+		} else if !validListenerProtocols[protocol] {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity:   types.SeverityWarning,
+				Category:   types.CategoryRouting,
+				Resource:   ref,
+				Summary:    fmt.Sprintf("%s: invalid protocol %q", prefix, protocol),
+				Detail:     "Valid protocols: HTTP, HTTPS, TLS, TCP, UDP",
+				Suggestion: "Use a valid Gateway API protocol value",
+			})
+		} else if extendedProtocols[protocol] {
+			extendedFeatures["protocol "+protocol] = true
+		}
+
+		// port validation (1-65535)
+		port, portOk := lm["port"].(float64)
+		if !portOk {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity:   types.SeverityWarning,
+				Category:   types.CategoryRouting,
+				Resource:   ref,
+				Summary:    fmt.Sprintf("%s: port is required but missing or invalid", prefix),
+				Suggestion: "Set port to a value between 1 and 65535",
+			})
+		} else if port < 1 || port > 65535 {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity:   types.SeverityWarning,
+				Category:   types.CategoryRouting,
+				Resource:   ref,
+				Summary:    fmt.Sprintf("%s: port %d is out of range (1-65535)", prefix, int(port)),
+				Suggestion: "Set port to a value between 1 and 65535",
+			})
+		}
+
+		// TLS validation for HTTPS and TLS protocols
+		if protocol == "HTTPS" || protocol == "TLS" {
+			tls, tlsFound, _ := unstructured.NestedMap(lm, "tls")
+			if !tlsFound {
+				findings = append(findings, types.DiagnosticFinding{
+					Severity:   types.SeverityWarning,
+					Category:   types.CategoryRouting,
+					Resource:   ref,
+					Summary:    fmt.Sprintf("%s: tls configuration is required for %s protocol", prefix, protocol),
+					Suggestion: "Add tls configuration with certificateRefs",
+				})
+			} else {
+				// TLS mode validation
+				mode, _ := tls["mode"].(string)
+				if mode != "" {
+					if !validTLSModes[mode] {
+						findings = append(findings, types.DiagnosticFinding{
+							Severity:   types.SeverityWarning,
+							Category:   types.CategoryRouting,
+							Resource:   ref,
+							Summary:    fmt.Sprintf("%s: invalid TLS mode %q", prefix, mode),
+							Detail:     "Valid TLS modes: Terminate, Passthrough",
+							Suggestion: "Use a valid TLS mode",
+						})
+					} else if extendedTLSModes[mode] {
+						extendedFeatures["TLS mode "+mode] = true
+					}
+				}
+
+				// certificateRefs required for Terminate mode (or default mode)
+				if mode == "" || mode == "Terminate" {
+					certRefs, _, _ := unstructured.NestedSlice(tls, "certificateRefs")
+					if len(certRefs) == 0 {
+						findings = append(findings, types.DiagnosticFinding{
+							Severity:   types.SeverityWarning,
+							Category:   types.CategoryRouting,
+							Resource:   ref,
+							Summary:    fmt.Sprintf("%s: tls.certificateRefs is required for TLS Terminate mode", prefix),
+							Suggestion: "Add at least one certificateRef pointing to a TLS Secret",
+						})
+					}
+				}
+			}
+		}
+	}
+
+	// Report extended profile if any extended features detected
+	if len(extendedFeatures) > 0 {
+		featureList := make([]string, 0, len(extendedFeatures))
+		for f := range extendedFeatures {
+			featureList = append(featureList, f)
+		}
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: types.SeverityInfo,
+			Category: types.CategoryRouting,
+			Resource: ref,
+			Summary:  fmt.Sprintf("Gateway uses extended conformance features: %s", strings.Join(featureList, ", ")),
+			Detail:   "These features require the implementation to support the extended conformance profile",
+		})
+	}
+
+	return findings
+}
+
+func (t *CheckGatewayConformanceTool) validateHTTPRoute(ctx context.Context, ns, name string) []types.DiagnosticFinding {
+	route, err := getWithFallback(ctx, t.Clients.Dynamic, httpRoutesV1GVR, httpRoutesV1B1GVR, ns, name)
+	if err != nil {
+		return []types.DiagnosticFinding{{
+			Severity: types.SeverityWarning,
+			Category: types.CategoryRouting,
+			Resource: &types.ResourceRef{Kind: "HTTPRoute", Namespace: ns, Name: name, APIVersion: "gateway.networking.k8s.io"},
+			Summary:  fmt.Sprintf("HTTPRoute %s/%s not found: %v", ns, name, err),
+		}}
+	}
+
+	ref := &types.ResourceRef{Kind: "HTTPRoute", Namespace: ns, Name: name, APIVersion: "gateway.networking.k8s.io"}
+	var findings []types.DiagnosticFinding
+	extendedFeatures := make(map[string]bool)
+
+	// parentRefs required
+	parentRefs, _, _ := unstructured.NestedSlice(route.Object, "spec", "parentRefs")
+	if len(parentRefs) == 0 {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity:   types.SeverityWarning,
+			Category:   types.CategoryRouting,
+			Resource:   ref,
+			Summary:    "spec.parentRefs is required but empty or missing",
+			Suggestion: "Add at least one parentRef pointing to a Gateway",
+		})
+	}
+
+	// Validate rules
+	rules, _, _ := unstructured.NestedSlice(route.Object, "spec", "rules")
+	for i, r := range rules {
+		rm, ok := r.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		prefix := fmt.Sprintf("spec.rules[%d]", i)
+
+		// Validate matches
+		if matches, ok := rm["matches"].([]interface{}); ok {
+			for j, m := range matches {
+				mm, ok := m.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				mPrefix := fmt.Sprintf("%s.matches[%d]", prefix, j)
+
+				// Path match type
+				if pathMatch, ok := mm["path"].(map[string]interface{}); ok {
+					matchType, _ := pathMatch["type"].(string)
+					if matchType != "" && !validPathMatchTypes[matchType] {
+						findings = append(findings, types.DiagnosticFinding{
+							Severity:   types.SeverityWarning,
+							Category:   types.CategoryRouting,
+							Resource:   ref,
+							Summary:    fmt.Sprintf("%s.path.type %q is not a valid PathMatchType", mPrefix, matchType),
+							Detail:     "Valid values: Exact, PathPrefix, RegularExpression",
+							Suggestion: "Use a valid PathMatchType",
+						})
+					} else if extendedPathMatchTypes[matchType] {
+						extendedFeatures["RegularExpression path match"] = true
+					}
+					// PathPrefix must start with /
+					if matchType == "PathPrefix" || matchType == "" {
+						value, _ := pathMatch["value"].(string)
+						if value != "" && !strings.HasPrefix(value, "/") {
+							findings = append(findings, types.DiagnosticFinding{
+								Severity:   types.SeverityWarning,
+								Category:   types.CategoryRouting,
+								Resource:   ref,
+								Summary:    fmt.Sprintf("%s.path.value %q must start with '/' for PathPrefix match", mPrefix, value),
+								Suggestion: "Prefix the path value with /",
+							})
+						}
+					}
+				}
+
+				// Header match types
+				if headers, ok := mm["headers"].([]interface{}); ok {
+					for k, h := range headers {
+						if hm, ok := h.(map[string]interface{}); ok {
+							hType, _ := hm["type"].(string)
+							if hType != "" && !validHeaderMatchTypes[hType] {
+								findings = append(findings, types.DiagnosticFinding{
+									Severity:   types.SeverityWarning,
+									Category:   types.CategoryRouting,
+									Resource:   ref,
+									Summary:    fmt.Sprintf("%s.headers[%d].type %q is not a valid HeaderMatchType", mPrefix, k, hType),
+									Detail:     "Valid values: Exact, RegularExpression",
+									Suggestion: "Use a valid HeaderMatchType",
+								})
+							}
+						}
+					}
+				}
+
+				// Query param match types
+				if queryParams, ok := mm["queryParams"].([]interface{}); ok {
+					for k, q := range queryParams {
+						if qm, ok := q.(map[string]interface{}); ok {
+							qType, _ := qm["type"].(string)
+							if qType != "" && !validQueryMatchTypes[qType] {
+								findings = append(findings, types.DiagnosticFinding{
+									Severity:   types.SeverityWarning,
+									Category:   types.CategoryRouting,
+									Resource:   ref,
+									Summary:    fmt.Sprintf("%s.queryParams[%d].type %q is not a valid QueryParamMatchType", mPrefix, k, qType),
+									Detail:     "Valid values: Exact, RegularExpression",
+									Suggestion: "Use a valid QueryParamMatchType",
+								})
+							}
+						}
+					}
+				}
+
+				// HTTP method
+				if method, ok := mm["method"].(string); ok {
+					if !validHTTPMethods[method] {
+						findings = append(findings, types.DiagnosticFinding{
+							Severity:   types.SeverityWarning,
+							Category:   types.CategoryRouting,
+							Resource:   ref,
+							Summary:    fmt.Sprintf("%s.method %q is not a valid HTTP method", mPrefix, method),
+							Detail:     "Valid values: GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS, TRACE, PATCH",
+							Suggestion: "Use a valid HTTP method",
+						})
+					}
+				}
+			}
+		}
+
+		// Validate filters
+		if filters, ok := rm["filters"].([]interface{}); ok {
+			for j, f := range filters {
+				if fm, ok := f.(map[string]interface{}); ok {
+					fType, _ := fm["type"].(string)
+					fPrefix := fmt.Sprintf("%s.filters[%d]", prefix, j)
+					if fType != "" && !validHTTPFilterTypes[fType] {
+						findings = append(findings, types.DiagnosticFinding{
+							Severity:   types.SeverityWarning,
+							Category:   types.CategoryRouting,
+							Resource:   ref,
+							Summary:    fmt.Sprintf("%s.type %q is not a valid HTTPRouteFilterType", fPrefix, fType),
+							Detail:     "Valid values: RequestHeaderModifier, ResponseHeaderModifier, RequestMirror, RequestRedirect, URLRewrite, ExtensionRef",
+							Suggestion: "Use a valid HTTPRouteFilterType",
+						})
+					} else if extendedHTTPFilters[fType] {
+						extendedFeatures["filter "+fType] = true
+					}
+				}
+			}
+		}
+
+		// Validate backendRefs — port is required for Service backends
+		if brs, ok := rm["backendRefs"].([]interface{}); ok {
+			for j, br := range brs {
+				if brm, ok := br.(map[string]interface{}); ok {
+					brKind, _ := brm["kind"].(string)
+					if brKind == "" || brKind == "Service" {
+						if _, hasPort := brm["port"]; !hasPort {
+							brName, _ := brm["name"].(string)
+							findings = append(findings, types.DiagnosticFinding{
+								Severity:   types.SeverityWarning,
+								Category:   types.CategoryRouting,
+								Resource:   ref,
+								Summary:    fmt.Sprintf("%s.backendRefs[%d]: port is required for Service backend %q", prefix, j, brName),
+								Suggestion: "Add a port field to the backendRef",
+							})
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Report extended profile
+	if len(extendedFeatures) > 0 {
+		featureList := make([]string, 0, len(extendedFeatures))
+		for f := range extendedFeatures {
+			featureList = append(featureList, f)
+		}
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: types.SeverityInfo,
+			Category: types.CategoryRouting,
+			Resource: ref,
+			Summary:  fmt.Sprintf("HTTPRoute uses extended conformance features: %s", strings.Join(featureList, ", ")),
+			Detail:   "These features require the implementation to support the extended conformance profile",
+		})
+	}
+
+	return findings
+}
+
+func (t *CheckGatewayConformanceTool) validateGRPCRoute(ctx context.Context, ns, name string) []types.DiagnosticFinding {
+	route, err := getWithFallback(ctx, t.Clients.Dynamic, grpcRoutesV1GVR, grpcRoutesV1B1GVR, ns, name)
+	if err != nil {
+		return []types.DiagnosticFinding{{
+			Severity: types.SeverityWarning,
+			Category: types.CategoryRouting,
+			Resource: &types.ResourceRef{Kind: "GRPCRoute", Namespace: ns, Name: name, APIVersion: "gateway.networking.k8s.io"},
+			Summary:  fmt.Sprintf("GRPCRoute %s/%s not found: %v", ns, name, err),
+		}}
+	}
+
+	ref := &types.ResourceRef{Kind: "GRPCRoute", Namespace: ns, Name: name, APIVersion: "gateway.networking.k8s.io"}
+	var findings []types.DiagnosticFinding
+	extendedFeatures := make(map[string]bool)
+
+	// parentRefs required
+	parentRefs, _, _ := unstructured.NestedSlice(route.Object, "spec", "parentRefs")
+	if len(parentRefs) == 0 {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity:   types.SeverityWarning,
+			Category:   types.CategoryRouting,
+			Resource:   ref,
+			Summary:    "spec.parentRefs is required but empty or missing",
+			Suggestion: "Add at least one parentRef pointing to a Gateway",
+		})
+	}
+
+	// Validate rules
+	rules, _, _ := unstructured.NestedSlice(route.Object, "spec", "rules")
+	for i, r := range rules {
+		rm, ok := r.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		prefix := fmt.Sprintf("spec.rules[%d]", i)
+
+		// Validate gRPC method matches
+		if matches, ok := rm["matches"].([]interface{}); ok {
+			for j, m := range matches {
+				mm, ok := m.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				mPrefix := fmt.Sprintf("%s.matches[%d]", prefix, j)
+
+				if method, ok := mm["method"].(map[string]interface{}); ok {
+					matchType, _ := method["type"].(string)
+					svc, _ := method["service"].(string)
+					meth, _ := method["method"].(string)
+
+					// type validation
+					if matchType != "" && !validGRPCMethodTypes[matchType] {
+						findings = append(findings, types.DiagnosticFinding{
+							Severity:   types.SeverityWarning,
+							Category:   types.CategoryRouting,
+							Resource:   ref,
+							Summary:    fmt.Sprintf("%s.method.type %q is not a valid GRPCMethodMatchType", mPrefix, matchType),
+							Detail:     "Valid values: Exact, RegularExpression",
+							Suggestion: "Use a valid GRPCMethodMatchType",
+						})
+					} else if extendedGRPCMethods[matchType] {
+						extendedFeatures["RegularExpression gRPC method match"] = true
+					}
+
+					// At least service or method must be specified
+					if svc == "" && meth == "" {
+						findings = append(findings, types.DiagnosticFinding{
+							Severity:   types.SeverityWarning,
+							Category:   types.CategoryRouting,
+							Resource:   ref,
+							Summary:    fmt.Sprintf("%s.method: at least one of service or method must be specified", mPrefix),
+							Suggestion: "Set service, method, or both in the gRPC method match",
+						})
+					}
+				}
+
+				// Header match types
+				if headers, ok := mm["headers"].([]interface{}); ok {
+					for k, h := range headers {
+						if hm, ok := h.(map[string]interface{}); ok {
+							hType, _ := hm["type"].(string)
+							if hType != "" && !validHeaderMatchTypes[hType] {
+								findings = append(findings, types.DiagnosticFinding{
+									Severity:   types.SeverityWarning,
+									Category:   types.CategoryRouting,
+									Resource:   ref,
+									Summary:    fmt.Sprintf("%s.headers[%d].type %q is not a valid HeaderMatchType", mPrefix, k, hType),
+									Detail:     "Valid values: Exact, RegularExpression",
+									Suggestion: "Use a valid HeaderMatchType",
+								})
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Validate filters
+		if filters, ok := rm["filters"].([]interface{}); ok {
+			for j, f := range filters {
+				if fm, ok := f.(map[string]interface{}); ok {
+					fType, _ := fm["type"].(string)
+					fPrefix := fmt.Sprintf("%s.filters[%d]", prefix, j)
+					if fType != "" && !validGRPCFilterTypes[fType] {
+						findings = append(findings, types.DiagnosticFinding{
+							Severity:   types.SeverityWarning,
+							Category:   types.CategoryRouting,
+							Resource:   ref,
+							Summary:    fmt.Sprintf("%s.type %q is not a valid GRPCRouteFilterType", fPrefix, fType),
+							Detail:     "Valid values: RequestHeaderModifier, ResponseHeaderModifier, RequestMirror, ExtensionRef",
+							Suggestion: "Use a valid GRPCRouteFilterType",
+						})
+					}
+				}
+			}
+		}
+
+		// Validate backendRefs — port required for Service
+		if brs, ok := rm["backendRefs"].([]interface{}); ok {
+			for j, br := range brs {
+				if brm, ok := br.(map[string]interface{}); ok {
+					brKind, _ := brm["kind"].(string)
+					if brKind == "" || brKind == "Service" {
+						if _, hasPort := brm["port"]; !hasPort {
+							brName, _ := brm["name"].(string)
+							findings = append(findings, types.DiagnosticFinding{
+								Severity:   types.SeverityWarning,
+								Category:   types.CategoryRouting,
+								Resource:   ref,
+								Summary:    fmt.Sprintf("%s.backendRefs[%d]: port is required for Service backend %q", prefix, j, brName),
+								Suggestion: "Add a port field to the backendRef",
+							})
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Report extended profile
+	if len(extendedFeatures) > 0 {
+		featureList := make([]string, 0, len(extendedFeatures))
+		for f := range extendedFeatures {
+			featureList = append(featureList, f)
+		}
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: types.SeverityInfo,
+			Category: types.CategoryRouting,
+			Resource: ref,
+			Summary:  fmt.Sprintf("GRPCRoute uses extended conformance features: %s", strings.Join(featureList, ", ")),
+			Detail:   "These features require the implementation to support the extended conformance profile",
+		})
+	}
+
+	return findings
+}
+
 // Helper functions
 
 func formatConditions(conditions []interface{}) string {
