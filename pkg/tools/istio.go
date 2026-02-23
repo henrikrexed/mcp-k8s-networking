@@ -668,3 +668,354 @@ func (t *CheckIstioMTLSTool) Run(ctx context.Context, args map[string]interface{
 
 	return NewToolResultResponse(t.Cfg, t.Name(), findings, ns, "istio"), nil
 }
+
+// --- validate_istio_config ---
+
+type ValidateIstioConfigTool struct{ BaseTool }
+
+func (t *ValidateIstioConfigTool) Name() string { return "validate_istio_config" }
+func (t *ValidateIstioConfigTool) Description() string {
+	return "Validate Istio VirtualService and DestinationRule configurations: route destinations, subset cross-references, weight sums, TLS settings, and service existence"
+}
+func (t *ValidateIstioConfigTool) InputSchema() map[string]interface{} {
+	return map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"namespace": map[string]interface{}{
+				"type":        "string",
+				"description": "Kubernetes namespace (empty for all namespaces)",
+			},
+		},
+	}
+}
+
+func (t *ValidateIstioConfigTool) Run(ctx context.Context, args map[string]interface{}) (*StandardResponse, error) {
+	ns := getStringArg(args, "namespace", "")
+
+	// Fetch VirtualServices
+	vsList, vsErr := listWithFallback(ctx, t.Clients.Dynamic, vsV1GVR, vsV1B1GVR, ns)
+	if vsErr != nil {
+		return nil, &types.MCPError{
+			Code:    types.ErrCodeCRDNotAvailable,
+			Tool:    t.Name(),
+			Message: "failed to list VirtualService",
+			Detail:  fmt.Sprintf("tried networking.istio.io v1 and v1beta1: %v", vsErr),
+		}
+	}
+
+	// Fetch DestinationRules
+	drList, drErr := listWithFallback(ctx, t.Clients.Dynamic, drV1GVR, drV1B1GVR, ns)
+	if drErr != nil {
+		return nil, &types.MCPError{
+			Code:    types.ErrCodeCRDNotAvailable,
+			Tool:    t.Name(),
+			Message: "failed to list DestinationRule",
+			Detail:  fmt.Sprintf("tried networking.istio.io v1 and v1beta1: %v", drErr),
+		}
+	}
+
+	var findings []types.DiagnosticFinding
+
+	// Validate each VirtualService
+	for i := range vsList.Items {
+		findings = append(findings, t.validateVirtualService(ctx, &vsList.Items[i], drList)...)
+	}
+
+	// Validate each DestinationRule
+	for i := range drList.Items {
+		findings = append(findings, t.validateDestinationRule(ctx, &drList.Items[i])...)
+	}
+
+	if len(findings) == 0 {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: types.SeverityOK,
+			Category: types.CategoryMesh,
+			Summary:  "All VirtualService and DestinationRule configurations passed validation",
+		})
+	}
+
+	return NewToolResultResponse(t.Cfg, t.Name(), findings, ns, "istio"), nil
+}
+
+// validateVirtualService checks a single VirtualService for misconfigurations.
+func (t *ValidateIstioConfigTool) validateVirtualService(ctx context.Context, vs *unstructured.Unstructured, drList *unstructured.UnstructuredList) []types.DiagnosticFinding {
+	vsNs := vs.GetNamespace()
+	vsName := vs.GetName()
+	ref := &types.ResourceRef{
+		Kind:       "VirtualService",
+		Namespace:  vsNs,
+		Name:       vsName,
+		APIVersion: "networking.istio.io",
+	}
+
+	var findings []types.DiagnosticFinding
+
+	// Check hosts
+	hosts, _, _ := unstructured.NestedStringSlice(vs.Object, "spec", "hosts")
+	if len(hosts) == 0 {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity:   types.SeverityWarning,
+			Category:   types.CategoryMesh,
+			Resource:   ref,
+			Summary:    fmt.Sprintf("VirtualService %s/%s has no hosts defined", vsNs, vsName),
+			Suggestion: "Add at least one host in spec.hosts",
+		})
+	}
+
+	// Validate HTTP routes
+	httpRoutes, _, _ := unstructured.NestedSlice(vs.Object, "spec", "http")
+	for ri, route := range httpRoutes {
+		routeMap, ok := route.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Check catch-all route ordering
+		matches, _, _ := unstructured.NestedSlice(routeMap, "match")
+		if len(matches) == 0 && ri < len(httpRoutes)-1 {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity: types.SeverityWarning,
+				Category: types.CategoryMesh,
+				Resource: ref,
+				Summary:  fmt.Sprintf("VirtualService %s/%s http route[%d] is a catch-all but not the last route", vsNs, vsName, ri),
+				Detail:   "Routes without match conditions match all requests. When placed before other routes, subsequent routes become unreachable.",
+				Suggestion: "Move the catch-all route to the end of the route list",
+			})
+		}
+
+		// Validate route destinations
+		routeDests, _, _ := unstructured.NestedSlice(routeMap, "route")
+		totalWeight := 0
+		hasExplicitWeight := false
+
+		for di, dest := range routeDests {
+			destMap, ok := dest.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			destHost, _, _ := unstructured.NestedString(destMap, "destination", "host")
+			destSubset, _, _ := unstructured.NestedString(destMap, "destination", "subset")
+			weight, weightFound, _ := unstructured.NestedFloat64(destMap, "weight")
+
+			if weightFound {
+				hasExplicitWeight = true
+				totalWeight += int(weight)
+			}
+
+			if destHost == "" {
+				findings = append(findings, types.DiagnosticFinding{
+					Severity:   types.SeverityCritical,
+					Category:   types.CategoryMesh,
+					Resource:   ref,
+					Summary:    fmt.Sprintf("VirtualService %s/%s http route[%d].route[%d] has no destination host", vsNs, vsName, ri, di),
+					Suggestion: "Set destination.host to a valid service name",
+				})
+				continue
+			}
+
+			// Verify destination service exists
+			svcNs, svcName := resolveIstioHost(destHost, vsNs)
+			_, svcErr := t.Clients.Dynamic.Resource(servicesGVR).Namespace(svcNs).Get(ctx, svcName, metav1.GetOptions{})
+			if svcErr != nil {
+				findings = append(findings, types.DiagnosticFinding{
+					Severity:   types.SeverityWarning,
+					Category:   types.CategoryMesh,
+					Resource:   ref,
+					Summary:    fmt.Sprintf("VirtualService %s/%s route destination host %q may not exist as a Service in %s", vsNs, vsName, destHost, svcNs),
+					Detail:     fmt.Sprintf("Service lookup failed: %v", svcErr),
+					Suggestion: "Verify the destination host matches an existing Kubernetes Service",
+				})
+			}
+
+			// Verify subset exists in DestinationRule
+			if destSubset != "" && !subsetExists(drList, destHost, destSubset, vsNs) {
+				findings = append(findings, types.DiagnosticFinding{
+					Severity:   types.SeverityCritical,
+					Category:   types.CategoryMesh,
+					Resource:   ref,
+					Summary:    fmt.Sprintf("VirtualService %s/%s references subset %q for host %q but no matching DestinationRule subset found", vsNs, vsName, destSubset, destHost),
+					Suggestion: "Create a DestinationRule with a matching subset definition, or remove the subset reference",
+				})
+			}
+		}
+
+		// Validate weight sum
+		if hasExplicitWeight && len(routeDests) > 1 && totalWeight != 100 {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity:   types.SeverityWarning,
+				Category:   types.CategoryMesh,
+				Resource:   ref,
+				Summary:    fmt.Sprintf("VirtualService %s/%s http route[%d] weight sum is %d (expected 100)", vsNs, vsName, ri, totalWeight),
+				Suggestion: "Adjust route weights to sum to 100",
+			})
+		}
+	}
+
+	// Validate TCP routes
+	tcpRoutes, _, _ := unstructured.NestedSlice(vs.Object, "spec", "tcp")
+	for ri, route := range tcpRoutes {
+		routeMap, ok := route.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		routeDests, _, _ := unstructured.NestedSlice(routeMap, "route")
+		for di, dest := range routeDests {
+			destMap, ok := dest.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			destHost, _, _ := unstructured.NestedString(destMap, "destination", "host")
+			if destHost == "" {
+				findings = append(findings, types.DiagnosticFinding{
+					Severity:   types.SeverityCritical,
+					Category:   types.CategoryMesh,
+					Resource:   ref,
+					Summary:    fmt.Sprintf("VirtualService %s/%s tcp route[%d].route[%d] has no destination host", vsNs, vsName, ri, di),
+					Suggestion: "Set destination.host to a valid service name",
+				})
+			}
+		}
+	}
+
+	return findings
+}
+
+// validateDestinationRule checks a single DestinationRule for misconfigurations.
+func (t *ValidateIstioConfigTool) validateDestinationRule(ctx context.Context, dr *unstructured.Unstructured) []types.DiagnosticFinding {
+	drNs := dr.GetNamespace()
+	drName := dr.GetName()
+	ref := &types.ResourceRef{
+		Kind:       "DestinationRule",
+		Namespace:  drNs,
+		Name:       drName,
+		APIVersion: "networking.istio.io",
+	}
+
+	var findings []types.DiagnosticFinding
+
+	// Verify host service exists
+	host, _, _ := unstructured.NestedString(dr.Object, "spec", "host")
+	if host != "" {
+		svcNs, svcName := resolveIstioHost(host, drNs)
+		_, svcErr := t.Clients.Dynamic.Resource(servicesGVR).Namespace(svcNs).Get(ctx, svcName, metav1.GetOptions{})
+		if svcErr != nil {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity:   types.SeverityWarning,
+				Category:   types.CategoryMesh,
+				Resource:   ref,
+				Summary:    fmt.Sprintf("DestinationRule %s/%s host %q may not exist as a Service in %s", drNs, drName, host, svcNs),
+				Detail:     fmt.Sprintf("Service lookup failed: %v", svcErr),
+				Suggestion: "Verify the host matches an existing Kubernetes Service",
+			})
+		}
+	}
+
+	// Validate subsets — check that labels match at least one pod
+	subsets, _, _ := unstructured.NestedSlice(dr.Object, "spec", "subsets")
+	for _, s := range subsets {
+		sm, ok := s.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		subsetName, _ := sm["name"].(string)
+		labels, _, _ := unstructured.NestedStringMap(sm, "labels")
+		if len(labels) == 0 {
+			continue
+		}
+
+		// Build label selector
+		labelParts := make([]string, 0, len(labels))
+		for k, v := range labels {
+			labelParts = append(labelParts, k+"="+v)
+		}
+		sort.Strings(labelParts)
+		labelSelector := strings.Join(labelParts, ",")
+
+		// Check if any pods match
+		svcNs, _ := resolveIstioHost(host, drNs)
+		podList, podErr := t.Clients.Dynamic.Resource(podsGVR).Namespace(svcNs).List(ctx, metav1.ListOptions{
+			LabelSelector: labelSelector,
+			Limit:         1,
+		})
+		if podErr == nil && len(podList.Items) == 0 {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity:   types.SeverityWarning,
+				Category:   types.CategoryMesh,
+				Resource:   ref,
+				Summary:    fmt.Sprintf("DestinationRule %s/%s subset %q labels {%s} match no pods in %s", drNs, drName, subsetName, labelSelector, svcNs),
+				Suggestion: "Verify subset labels match the pod template labels of the target deployment",
+			})
+		}
+	}
+
+	// Validate TLS settings
+	tlsMode, _, _ := unstructured.NestedString(dr.Object, "spec", "trafficPolicy", "tls", "mode")
+	if tlsMode == "MUTUAL" {
+		// MUTUAL mode requires client cert/key
+		clientCert, _, _ := unstructured.NestedString(dr.Object, "spec", "trafficPolicy", "tls", "clientCertificate")
+		privateKey, _, _ := unstructured.NestedString(dr.Object, "spec", "trafficPolicy", "tls", "privateKey")
+		if clientCert == "" || privateKey == "" {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity:   types.SeverityCritical,
+				Category:   types.CategoryTLS,
+				Resource:   ref,
+				Summary:    fmt.Sprintf("DestinationRule %s/%s TLS mode is MUTUAL but missing client certificate or private key", drNs, drName),
+				Detail:     fmt.Sprintf("clientCertificate=%q privateKey=%q", clientCert, privateKey),
+				Suggestion: "Set trafficPolicy.tls.clientCertificate and trafficPolicy.tls.privateKey for MUTUAL TLS, or use ISTIO_MUTUAL to let Istio manage certificates",
+			})
+		}
+	}
+
+	// Validate connection pool settings
+	maxConnections, connFound, _ := unstructured.NestedFloat64(dr.Object, "spec", "trafficPolicy", "connectionPool", "tcp", "maxConnections")
+	if connFound && maxConnections <= 0 {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity:   types.SeverityWarning,
+			Category:   types.CategoryMesh,
+			Resource:   ref,
+			Summary:    fmt.Sprintf("DestinationRule %s/%s has tcp.maxConnections=%d (non-positive)", drNs, drName, int(maxConnections)),
+			Suggestion: "Set a positive value for connectionPool.tcp.maxConnections",
+		})
+	}
+
+	http1MaxPending, pendingFound, _ := unstructured.NestedFloat64(dr.Object, "spec", "trafficPolicy", "connectionPool", "http", "h2UpgradePolicy")
+	_ = http1MaxPending
+	_ = pendingFound
+
+	return findings
+}
+
+// subsetExists checks whether a named subset is defined in any DestinationRule for the given host.
+func subsetExists(drList *unstructured.UnstructuredList, host, subsetName, vsNamespace string) bool {
+	_, hostSvc := resolveIstioHost(host, vsNamespace)
+	for _, dr := range drList.Items {
+		drHost, _, _ := unstructured.NestedString(dr.Object, "spec", "host")
+		_, drSvc := resolveIstioHost(drHost, dr.GetNamespace())
+		if drSvc != hostSvc {
+			continue
+		}
+		subsets, _, _ := unstructured.NestedSlice(dr.Object, "spec", "subsets")
+		for _, s := range subsets {
+			if sm, ok := s.(map[string]interface{}); ok {
+				if name, _ := sm["name"].(string); name == subsetName {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// resolveIstioHost parses an Istio host string and returns (namespace, serviceName).
+// Supports formats: "svc", "svc.ns", "svc.ns.svc.cluster.local".
+func resolveIstioHost(host, defaultNs string) (string, string) {
+	// Remove trailing .svc.cluster.local
+	host = strings.TrimSuffix(host, ".svc.cluster.local")
+
+	parts := strings.SplitN(host, ".", 2)
+	if len(parts) == 2 {
+		return parts[1], parts[0]
+	}
+	return defaultNs, host
+}
