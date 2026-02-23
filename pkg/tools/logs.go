@@ -139,7 +139,7 @@ func (t *GetGatewayLogsTool) Run(ctx context.Context, args map[string]interface{
 		{"gateway-system", "app.kubernetes.io/name=gateway-api", "Gateway API controller"},
 	}
 
-	results := make([]map[string]interface{}, 0)
+	var findings []types.DiagnosticFinding
 
 	for _, gl := range gatewayLabels {
 		searchNs := gl.namespace
@@ -159,20 +159,42 @@ func (t *GetGatewayLogsTool) Run(ctx context.Context, args map[string]interface{
 			if err != nil {
 				continue
 			}
-			results = append(results, map[string]interface{}{
-				"pod":         pod.Name,
-				"namespace":   pod.Namespace,
-				"container":   container,
-				"description": gl.desc,
-				"logs":        lr.logs,
+			findings = append(findings, types.DiagnosticFinding{
+				Severity: types.SeverityInfo,
+				Category: types.CategoryLogs,
+				Resource: &types.ResourceRef{
+					Kind:      "Pod",
+					Namespace: pod.Namespace,
+					Name:      pod.Name,
+				},
+				Summary: fmt.Sprintf("Retrieved %d log lines from %s/%s container %s (%s)", lr.returnedLines, pod.Namespace, pod.Name, container, gl.desc),
+				Detail:  lr.logs,
 			})
+			if lr.truncated {
+				findings = append(findings, types.DiagnosticFinding{
+					Severity:   types.SeverityWarning,
+					Category:   types.CategoryLogs,
+					Summary:    fmt.Sprintf("Log output truncated at 100KB limit for %s/%s container %s", pod.Namespace, pod.Name, container),
+					Suggestion: "Use a smaller --tail value or narrower --since window to avoid truncation",
+				})
+			}
 		}
 	}
 
-	return NewResponse(t.Cfg, t.Name(), map[string]interface{}{
-		"podCount": len(results),
-		"results":  results,
-	}), nil
+	if len(findings) == 0 {
+		return nil, &types.MCPError{
+			Code:    types.ErrCodeProviderNotFound,
+			Tool:    t.Name(),
+			Message: "no gateway controller pods found",
+			Detail:  "searched for Istio, Envoy Gateway, and Gateway API controller pods by known labels",
+		}
+	}
+
+	responseNs := ns
+	if responseNs == "" {
+		responseNs = "all"
+	}
+	return NewToolResultResponse(t.Cfg, t.Name(), findings, responseNs, ""), nil
 }
 
 // --- get_infra_logs ---
@@ -229,10 +251,20 @@ func (t *GetInfraLogsTool) Run(ctx context.Context, args map[string]interface{})
 			}
 		}
 		if labelSelector == "" {
-			return nil, fmt.Errorf("no CNI pods found in namespace %s", ns)
+			return nil, &types.MCPError{
+				Code:    types.ErrCodeProviderNotFound,
+				Tool:    t.Name(),
+				Message: fmt.Sprintf("no CNI pods found in namespace %s", ns),
+				Detail:  "searched for Cilium, Calico, Flannel, and kube-proxy pods by known labels",
+			}
 		}
 	default:
-		return nil, fmt.Errorf("unsupported component: %s (use kube-proxy, coredns, or cni)", component)
+		return nil, &types.MCPError{
+			Code:    types.ErrCodeInvalidInput,
+			Tool:    t.Name(),
+			Message: fmt.Sprintf("unsupported component: %s", component),
+			Detail:  "supported components: kube-proxy, coredns, cni",
+		}
 	}
 
 	pods, err := t.Clients.Clientset.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{
@@ -242,30 +274,42 @@ func (t *GetInfraLogsTool) Run(ctx context.Context, args map[string]interface{})
 		return nil, fmt.Errorf("failed to list %s pods: %w", component, err)
 	}
 	if len(pods.Items) == 0 {
-		return nil, fmt.Errorf("no %s pods found with selector %s in %s", component, labelSelector, ns)
+		return nil, &types.MCPError{
+			Code:    types.ErrCodeProviderNotFound,
+			Tool:    t.Name(),
+			Message: fmt.Sprintf("no %s pods found with selector %s in %s", component, labelSelector, ns),
+		}
 	}
 
-	results := make([]map[string]interface{}, 0, len(pods.Items))
+	var findings []types.DiagnosticFinding
 	for _, pod := range pods.Items {
 		container := pod.Spec.Containers[0].Name
 		lr, err := getPodLogs(ctx, t.Clients, ns, pod.Name, container, int64(tail), since)
 		if err != nil {
 			continue
 		}
-		results = append(results, map[string]interface{}{
-			"pod":       pod.Name,
-			"namespace": ns,
-			"container": container,
-			"node":      pod.Spec.NodeName,
-			"logs":      lr.logs,
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: types.SeverityInfo,
+			Category: types.CategoryLogs,
+			Resource: &types.ResourceRef{
+				Kind:      "Pod",
+				Namespace: ns,
+				Name:      pod.Name,
+			},
+			Summary: fmt.Sprintf("Retrieved %d log lines from %s/%s container %s (node %s, component %s)", lr.returnedLines, ns, pod.Name, container, pod.Spec.NodeName, component),
+			Detail:  lr.logs,
 		})
+		if lr.truncated {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity:   types.SeverityWarning,
+				Category:   types.CategoryLogs,
+				Summary:    fmt.Sprintf("Log output truncated at 100KB limit for %s/%s container %s", ns, pod.Name, container),
+				Suggestion: "Use a smaller --tail value or narrower --since window to avoid truncation",
+			})
+		}
 	}
 
-	return NewResponse(t.Cfg, t.Name(), map[string]interface{}{
-		"component": component,
-		"podCount":  len(results),
-		"results":   results,
-	}), nil
+	return NewToolResultResponse(t.Cfg, t.Name(), findings, ns, ""), nil
 }
 
 // --- analyze_log_errors ---
