@@ -332,6 +332,8 @@ func (t *AnalyzeLogErrorsTool) InputSchema() map[string]interface{} {
 	}
 }
 
+const maxErrorLines = 50
+
 func (t *AnalyzeLogErrorsTool) Run(ctx context.Context, args map[string]interface{}) (*StandardResponse, error) {
 	podName := getStringArg(args, "pod", "")
 	ns := getStringArg(args, "namespace", "default")
@@ -358,59 +360,128 @@ func (t *AnalyzeLogErrorsTool) Run(ctx context.Context, args map[string]interfac
 		return nil, err
 	}
 
-	// Filter for error patterns
-	errorLines := make([]string, 0)
+	// Filter for error patterns and categorize
+	type categorizedLines struct {
+		category string
+		lines    []string
+	}
+	categoryMap := map[string]*categorizedLines{
+		"connection_errors": {category: "connection_errors"},
+		"tls_errors":        {category: "tls_errors"},
+		"rate_limiting":     {category: "rate_limiting"},
+		"misconfig":         {category: "misconfig"},
+		"rbac_denied":       {category: "rbac_denied"},
+		"upstream_issues":   {category: "upstream_issues"},
+		"timeout":           {category: "timeout"},
+		"other_errors":      {category: "other_errors"},
+	}
+
+	totalErrorLines := 0
 	scanner := bufio.NewScanner(strings.NewReader(lr.logs))
 	for scanner.Scan() {
 		line := scanner.Text()
-		if errorPatterns.MatchString(line) {
-			errorLines = append(errorLines, line)
+		if !errorPatterns.MatchString(line) {
+			continue
 		}
-	}
+		totalErrorLines++
 
-	// Categorize errors
-	categories := map[string]int{
-		"connection_errors":  0,
-		"tls_errors":        0,
-		"rate_limiting":     0,
-		"misconfig":         0,
-		"rbac_denied":       0,
-		"upstream_issues":   0,
-		"timeout":           0,
-		"other_errors":      0,
-	}
-
-	for _, line := range errorLines {
 		lower := strings.ToLower(line)
+		var cat string
 		switch {
 		case strings.Contains(lower, "connection refused") || strings.Contains(lower, "no healthy"):
-			categories["connection_errors"]++
+			cat = "connection_errors"
 		case strings.Contains(lower, "tls"):
-			categories["tls_errors"]++
+			cat = "tls_errors"
 		case strings.Contains(lower, "rate") || strings.Contains(lower, "429") || strings.Contains(lower, "overflow"):
-			categories["rate_limiting"]++
+			cat = "rate_limiting"
 		case strings.Contains(lower, "misconfigur") || strings.Contains(lower, "invalid"):
-			categories["misconfig"]++
+			cat = "misconfig"
 		case strings.Contains(lower, "rbac") || strings.Contains(lower, "denied") || strings.Contains(lower, "403"):
-			categories["rbac_denied"]++
+			cat = "rbac_denied"
 		case strings.Contains(lower, "upstream") || strings.Contains(lower, "503") || strings.Contains(lower, "circuit"):
-			categories["upstream_issues"]++
+			cat = "upstream_issues"
 		case strings.Contains(lower, "timeout"):
-			categories["timeout"]++
+			cat = "timeout"
 		default:
-			categories["other_errors"]++
+			cat = "other_errors"
 		}
+		categoryMap[cat].lines = append(categoryMap[cat].lines, line)
 	}
 
-	return NewResponse(t.Cfg, t.Name(), map[string]interface{}{
-		"pod":            podName,
-		"namespace":      ns,
-		"container":      container,
-		"totalLines":     tail,
-		"errorLineCount": len(errorLines),
-		"categories":     categories,
-		"errorLines":     errorLines,
-	}), nil
+	podRef := &types.ResourceRef{
+		Kind:      "Pod",
+		Namespace: ns,
+		Name:      podName,
+	}
+
+	// No errors found — return ok finding
+	if totalErrorLines == 0 {
+		findings := []types.DiagnosticFinding{
+			{
+				Severity: types.SeverityOK,
+				Category: types.CategoryLogs,
+				Resource: podRef,
+				Summary:  fmt.Sprintf("No error patterns found in %d log lines from %s/%s container %s", lr.returnedLines, ns, podName, container),
+			},
+		}
+		return NewToolResultResponse(t.Cfg, t.Name(), findings, ns, ""), nil
+	}
+
+	// Build summary counts string and findings per non-zero category
+	var findings []types.DiagnosticFinding
+	var countParts []string
+
+	// Stable iteration order for categories
+	categoryOrder := []string{
+		"connection_errors", "tls_errors", "rate_limiting", "misconfig",
+		"rbac_denied", "upstream_issues", "timeout", "other_errors",
+	}
+	for _, catName := range categoryOrder {
+		cl := categoryMap[catName]
+		if len(cl.lines) == 0 {
+			continue
+		}
+		countParts = append(countParts, fmt.Sprintf("%s=%d", catName, len(cl.lines)))
+
+		// Cap lines in detail
+		detail := cl.lines
+		if len(detail) > maxErrorLines {
+			detail = detail[:maxErrorLines]
+		}
+
+		severity := types.SeverityWarning
+		if catName == "other_errors" {
+			severity = types.SeverityInfo
+		}
+
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: severity,
+			Category: types.CategoryLogs,
+			Resource: podRef,
+			Summary:  fmt.Sprintf("%d %s lines in %s/%s container %s", len(cl.lines), catName, ns, podName, container),
+			Detail:   strings.Join(detail, "\n"),
+		})
+	}
+
+	// Prepend an overall summary finding
+	summaryFinding := types.DiagnosticFinding{
+		Severity: types.SeverityWarning,
+		Category: types.CategoryLogs,
+		Resource: podRef,
+		Summary:  fmt.Sprintf("Found %d error lines in %d log lines from %s/%s container %s: %s", totalErrorLines, lr.returnedLines, ns, podName, container, strings.Join(countParts, ", ")),
+	}
+	findings = append([]types.DiagnosticFinding{summaryFinding}, findings...)
+
+	if lr.truncated {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity:   types.SeverityWarning,
+			Category:   types.CategoryLogs,
+			Summary:    fmt.Sprintf("Log input was truncated at 100KB limit for %s/%s container %s — error counts may be incomplete", ns, podName, container),
+			Suggestion: "Use a smaller --tail value or narrower --since window to get complete analysis",
+		})
+	}
+
+	return NewToolResultResponse(t.Cfg, t.Name(), findings, ns, ""), nil
 }
 
 // Helper functions
