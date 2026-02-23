@@ -14,10 +14,12 @@ import (
 )
 
 var (
-	gatewaysV1GVR    = schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "gateways"}
-	gatewaysV1B1GVR  = schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1beta1", Resource: "gateways"}
-	httpRoutesV1GVR  = schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "httproutes"}
+	gatewaysV1GVR     = schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "gateways"}
+	gatewaysV1B1GVR   = schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1beta1", Resource: "gateways"}
+	httpRoutesV1GVR   = schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "httproutes"}
 	httpRoutesV1B1GVR = schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1beta1", Resource: "httproutes"}
+	grpcRoutesV1GVR   = schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "grpcroutes"}
+	grpcRoutesV1B1GVR = schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1beta1", Resource: "grpcroutes"}
 )
 
 // listWithFallback tries listing with the v1 GVR first, falling back to v1beta1.
@@ -644,6 +646,344 @@ func (t *GetHTTPRouteTool) Run(ctx context.Context, args map[string]interface{})
 						Summary:    fmt.Sprintf("Route condition %s=%s for parent %s reason=%s", condType, status, pName, reason),
 						Detail:     message,
 						Suggestion: "Check that the parent gateway and listener accept this route",
+					})
+				}
+			}
+		}
+	}
+
+	return NewToolResultResponse(t.Cfg, t.Name(), findings, ns, "gateway-api"), nil
+}
+
+// --- list_grpcroutes ---
+
+type ListGRPCRoutesTool struct{ BaseTool }
+
+func (t *ListGRPCRoutesTool) Name() string        { return "list_grpcroutes" }
+func (t *ListGRPCRoutesTool) Description() string  { return "List GRPCRoutes with parent refs, backend refs, and rule counts" }
+func (t *ListGRPCRoutesTool) InputSchema() map[string]interface{} {
+	return map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"namespace": map[string]interface{}{
+				"type":        "string",
+				"description": "Kubernetes namespace (empty for all namespaces)",
+			},
+		},
+	}
+}
+
+func (t *ListGRPCRoutesTool) Run(ctx context.Context, args map[string]interface{}) (*StandardResponse, error) {
+	ns := getStringArg(args, "namespace", "")
+
+	list, err := listWithFallback(ctx, t.Clients.Dynamic, grpcRoutesV1GVR, grpcRoutesV1B1GVR, ns)
+	if err != nil {
+		return nil, &types.MCPError{
+			Code:    types.ErrCodeCRDNotAvailable,
+			Tool:    t.Name(),
+			Message: "failed to list grpcroutes",
+			Detail:  fmt.Sprintf("tried gateway.networking.k8s.io/v1 and v1beta1: %v", err),
+		}
+	}
+
+	findings := make([]types.DiagnosticFinding, 0, len(list.Items))
+	for _, item := range list.Items {
+		parentRefs, _, _ := unstructured.NestedSlice(item.Object, "spec", "parentRefs")
+		rules, _, _ := unstructured.NestedSlice(item.Object, "spec", "rules")
+
+		parentRefParts := make([]string, 0, len(parentRefs))
+		for _, pr := range parentRefs {
+			if prm, ok := pr.(map[string]interface{}); ok {
+				refName, _ := prm["name"].(string)
+				refNs, _ := prm["namespace"].(string)
+				section, _ := prm["sectionName"].(string)
+				part := refName
+				if refNs != "" {
+					part = refNs + "/" + part
+				}
+				if section != "" {
+					part += "/" + section
+				}
+				parentRefParts = append(parentRefParts, part)
+			}
+		}
+
+		// Extract backend refs from rules
+		backendRefParts := make([]string, 0)
+		for _, r := range rules {
+			if rm, ok := r.(map[string]interface{}); ok {
+				if brs, ok := rm["backendRefs"].([]interface{}); ok {
+					for _, br := range brs {
+						if brm, ok := br.(map[string]interface{}); ok {
+							brName, _ := brm["name"].(string)
+							brPort := fmt.Sprintf("%v", brm["port"])
+							backendRefParts = append(backendRefParts, fmt.Sprintf("%s:%s", brName, brPort))
+						}
+					}
+				}
+			}
+		}
+
+		summary := fmt.Sprintf("%s/%s parents=[%s] rules=%d backends=[%s]",
+			item.GetNamespace(), item.GetName(),
+			strings.Join(parentRefParts, ", "),
+			len(rules),
+			strings.Join(backendRefParts, ", "))
+
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: types.SeverityInfo,
+			Category: types.CategoryRouting,
+			Resource: &types.ResourceRef{
+				Kind:       "GRPCRoute",
+				Namespace:  item.GetNamespace(),
+				Name:       item.GetName(),
+				APIVersion: "gateway.networking.k8s.io",
+			},
+			Summary: summary,
+		})
+	}
+
+	return NewToolResultResponse(t.Cfg, t.Name(), findings, ns, "gateway-api"), nil
+}
+
+// --- get_grpcroute ---
+
+type GetGRPCRouteTool struct{ BaseTool }
+
+func (t *GetGRPCRouteTool) Name() string        { return "get_grpcroute" }
+func (t *GetGRPCRouteTool) Description() string  { return "Get full GRPCRoute: method matching rules, backend refs with health, and status conditions" }
+func (t *GetGRPCRouteTool) InputSchema() map[string]interface{} {
+	return map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"name": map[string]interface{}{
+				"type":        "string",
+				"description": "GRPCRoute name",
+			},
+			"namespace": map[string]interface{}{
+				"type":        "string",
+				"description": "Kubernetes namespace",
+			},
+		},
+		"required": []string{"name", "namespace"},
+	}
+}
+
+func (t *GetGRPCRouteTool) Run(ctx context.Context, args map[string]interface{}) (*StandardResponse, error) {
+	name := getStringArg(args, "name", "")
+	ns := getStringArg(args, "namespace", "default")
+
+	route, err := getWithFallback(ctx, t.Clients.Dynamic, grpcRoutesV1GVR, grpcRoutesV1B1GVR, ns, name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get grpcroute %s/%s: %w", ns, name, err)
+	}
+
+	routeRef := &types.ResourceRef{
+		Kind:       "GRPCRoute",
+		Namespace:  ns,
+		Name:       name,
+		APIVersion: "gateway.networking.k8s.io",
+	}
+
+	parentRefs, _, _ := unstructured.NestedSlice(route.Object, "spec", "parentRefs")
+	rules, _, _ := unstructured.NestedSlice(route.Object, "spec", "rules")
+
+	var findings []types.DiagnosticFinding
+
+	// Parent refs summary
+	parentRefParts := make([]string, 0, len(parentRefs))
+	for _, pr := range parentRefs {
+		if prm, ok := pr.(map[string]interface{}); ok {
+			refName, _ := prm["name"].(string)
+			refNs, _ := prm["namespace"].(string)
+			section, _ := prm["sectionName"].(string)
+			part := refName
+			if refNs != "" {
+				part = refNs + "/" + part
+			}
+			if section != "" {
+				part += "/" + section
+			}
+			parentRefParts = append(parentRefParts, part)
+		}
+	}
+
+	// Main route finding
+	findings = append(findings, types.DiagnosticFinding{
+		Severity: types.SeverityInfo,
+		Category: types.CategoryRouting,
+		Resource: routeRef,
+		Summary:  fmt.Sprintf("GRPCRoute %s/%s parents=[%s] rules=%d", ns, name, strings.Join(parentRefParts, ", "), len(rules)),
+	})
+
+	// Per-rule findings with method matches and backend refs
+	for i, r := range rules {
+		rm, ok := r.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Extract gRPC method matches
+		matchParts := make([]string, 0)
+		if matches, ok := rm["matches"].([]interface{}); ok {
+			for _, m := range matches {
+				if mm, ok := m.(map[string]interface{}); ok {
+					if method, ok := mm["method"].(map[string]interface{}); ok {
+						svc, _ := method["service"].(string)
+						meth, _ := method["method"].(string)
+						matchType, _ := method["type"].(string)
+						if matchType == "" {
+							matchType = "Exact"
+						}
+						matchParts = append(matchParts, fmt.Sprintf("%s(%s/%s)", matchType, svc, meth))
+					}
+					if headers, ok := mm["headers"].([]interface{}); ok {
+						for _, h := range headers {
+							if hm, ok := h.(map[string]interface{}); ok {
+								hName, _ := hm["name"].(string)
+								matchParts = append(matchParts, fmt.Sprintf("header(%s)", hName))
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Extract filters
+		filterParts := make([]string, 0)
+		if filters, ok := rm["filters"].([]interface{}); ok {
+			for _, f := range filters {
+				if fm, ok := f.(map[string]interface{}); ok {
+					fType, _ := fm["type"].(string)
+					filterParts = append(filterParts, fType)
+				}
+			}
+		}
+
+		// Extract backend refs
+		backendParts := make([]string, 0)
+		if brs, ok := rm["backendRefs"].([]interface{}); ok {
+			for _, br := range brs {
+				if brm, ok := br.(map[string]interface{}); ok {
+					brName, _ := brm["name"].(string)
+					brPort := fmt.Sprintf("%v", brm["port"])
+					weight := ""
+					if w, ok := brm["weight"].(float64); ok {
+						weight = fmt.Sprintf(" weight=%d", int(w))
+					}
+					backendParts = append(backendParts, fmt.Sprintf("%s:%s%s", brName, brPort, weight))
+				}
+			}
+		}
+
+		ruleSummary := fmt.Sprintf("Rule %d: matches=[%s] filters=[%s] backends=[%s]",
+			i, strings.Join(matchParts, ", "), strings.Join(filterParts, ", "), strings.Join(backendParts, ", "))
+
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: types.SeverityInfo,
+			Category: types.CategoryRouting,
+			Resource: routeRef,
+			Summary:  ruleSummary,
+		})
+	}
+
+	// Check backend service health
+	for _, r := range rules {
+		rm, ok := r.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		brs, ok := rm["backendRefs"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, br := range brs {
+			brm, ok := br.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			refName, _ := brm["name"].(string)
+			refNs := ns
+			if rns, ok := brm["namespace"].(string); ok && rns != "" {
+				refNs = rns
+			}
+
+			_, svcErr := t.Clients.Dynamic.Resource(servicesGVR).Namespace(refNs).Get(ctx, refName, metav1.GetOptions{})
+			if svcErr != nil {
+				findings = append(findings, types.DiagnosticFinding{
+					Severity:   types.SeverityWarning,
+					Category:   types.CategoryRouting,
+					Resource:   routeRef,
+					Summary:    fmt.Sprintf("Backend service %s/%s not found", refNs, refName),
+					Detail:     svcErr.Error(),
+					Suggestion: "Verify the backend service name and namespace are correct",
+				})
+				continue
+			}
+
+			ep, epErr := t.Clients.Dynamic.Resource(endpointsGVR).Namespace(refNs).Get(ctx, refName, metav1.GetOptions{})
+			if epErr != nil {
+				continue
+			}
+			subsets, _, _ := unstructured.NestedSlice(ep.Object, "subsets")
+			readyCount := 0
+			for _, s := range subsets {
+				if sm, ok := s.(map[string]interface{}); ok {
+					if addrs, ok := sm["addresses"].([]interface{}); ok {
+						readyCount += len(addrs)
+					}
+				}
+			}
+			if readyCount == 0 {
+				findings = append(findings, types.DiagnosticFinding{
+					Severity:   types.SeverityWarning,
+					Category:   types.CategoryRouting,
+					Resource:   routeRef,
+					Summary:    fmt.Sprintf("Backend service %s/%s has 0 ready endpoints", refNs, refName),
+					Suggestion: "Check that pods backing this service are running and passing readiness probes",
+				})
+			} else {
+				findings = append(findings, types.DiagnosticFinding{
+					Severity: types.SeverityOK,
+					Category: types.CategoryRouting,
+					Resource: routeRef,
+					Summary:  fmt.Sprintf("Backend service %s/%s has %d ready endpoints", refNs, refName, readyCount),
+				})
+			}
+		}
+	}
+
+	// Route status conditions (from parent statuses)
+	parentStatuses, _, _ := unstructured.NestedSlice(route.Object, "status", "parents")
+	for _, ps := range parentStatuses {
+		psm, ok := ps.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		parentName, _ := psm["parentRef"].(map[string]interface{})
+		pName := ""
+		if parentName != nil {
+			pName, _ = parentName["name"].(string)
+		}
+		if conds, ok := psm["conditions"].([]interface{}); ok {
+			for _, c := range conds {
+				cm, ok := c.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				status, _ := cm["status"].(string)
+				condType, _ := cm["type"].(string)
+				reason, _ := cm["reason"].(string)
+				message, _ := cm["message"].(string)
+
+				if status == "False" {
+					findings = append(findings, types.DiagnosticFinding{
+						Severity:   types.SeverityWarning,
+						Category:   types.CategoryRouting,
+						Resource:   routeRef,
+						Summary:    fmt.Sprintf("Route condition %s=%s for parent %s reason=%s", condType, status, pName, reason),
+						Detail:     message,
+						Suggestion: "Check that the parent gateway and listener accept this GRPCRoute",
 					})
 				}
 			}
