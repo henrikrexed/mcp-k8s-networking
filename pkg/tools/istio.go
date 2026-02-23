@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 
 	"github.com/isitobservable/k8s-networking-mcp/pkg/types"
 )
@@ -341,8 +342,10 @@ func istioResourceSummary(kind string, item *unstructured.Unstructured) (string,
 
 type CheckSidecarInjectionTool struct{ BaseTool }
 
-func (t *CheckSidecarInjectionTool) Name() string        { return "check_sidecar_injection" }
-func (t *CheckSidecarInjectionTool) Description() string  { return "Check Istio sidecar injection status for all deployments in a namespace" }
+func (t *CheckSidecarInjectionTool) Name() string { return "check_sidecar_injection" }
+func (t *CheckSidecarInjectionTool) Description() string {
+	return "Check Istio sidecar injection status for all deployments in a namespace: namespace label, annotations, actual sidecar presence"
+}
 func (t *CheckSidecarInjectionTool) InputSchema() map[string]interface{} {
 	return map[string]interface{}{
 		"type": "object",
@@ -361,85 +364,155 @@ var deploymentsGVR = schema.GroupVersionResource{Group: "apps", Version: "v1", R
 func (t *CheckSidecarInjectionTool) Run(ctx context.Context, args map[string]interface{}) (*StandardResponse, error) {
 	ns := getStringArg(args, "namespace", "default")
 
-	// Check namespace label
-	nsObj, err := t.Clients.Dynamic.Resource(schema.GroupVersionResource{Version: "v1", Resource: "namespaces"}).Get(ctx, ns, metav1.GetOptions{})
+	var findings []types.DiagnosticFinding
+
+	// Check namespace injection label
 	nsInjectionLabel := ""
-	if err == nil {
-		labels := nsObj.GetLabels()
-		nsInjectionLabel = labels["istio-injection"]
-		if nsInjectionLabel == "" {
-			nsInjectionLabel = labels["istio.io/rev"]
+	nsInjectionEnabled := false
+	nsObj, err := t.Clients.Dynamic.Resource(schema.GroupVersionResource{Version: "v1", Resource: "namespaces"}).Get(ctx, ns, metav1.GetOptions{})
+	if err != nil {
+		return nil, &types.MCPError{
+			Code:    types.ErrCodeInternalError,
+			Tool:    t.Name(),
+			Message: fmt.Sprintf("failed to get namespace %s", ns),
+			Detail:  err.Error(),
 		}
+	}
+
+	labels := nsObj.GetLabels()
+	nsInjectionLabel = labels["istio-injection"]
+	if nsInjectionLabel == "" {
+		nsInjectionLabel = labels["istio.io/rev"]
+	}
+	nsInjectionEnabled = nsInjectionLabel == "enabled" || (nsInjectionLabel != "" && nsInjectionLabel != "disabled")
+
+	if nsInjectionEnabled {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: types.SeverityInfo,
+			Category: types.CategoryMesh,
+			Resource: &types.ResourceRef{Kind: "Namespace", Name: ns},
+			Summary:  fmt.Sprintf("Namespace %s has injection label=%s", ns, nsInjectionLabel),
+		})
+	} else {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity:   types.SeverityWarning,
+			Category:   types.CategoryMesh,
+			Resource:   &types.ResourceRef{Kind: "Namespace", Name: ns},
+			Summary:    fmt.Sprintf("Namespace %s does not have Istio injection enabled (label=%q)", ns, nsInjectionLabel),
+			Suggestion: "Add label istio-injection=enabled or istio.io/rev=<tag> to enable sidecar injection",
+		})
 	}
 
 	// List deployments
 	depList, err := t.Clients.Dynamic.Resource(deploymentsGVR).Namespace(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to list deployments in %s: %w", ns, err)
+		return nil, &types.MCPError{
+			Code:    types.ErrCodeInternalError,
+			Tool:    t.Name(),
+			Message: fmt.Sprintf("failed to list deployments in %s", ns),
+			Detail:  err.Error(),
+		}
 	}
 
-	deployments := make([]map[string]interface{}, 0, len(depList.Items))
 	for _, dep := range depList.Items {
+		depName := dep.GetName()
+		depRef := &types.ResourceRef{
+			Kind:       "Deployment",
+			Namespace:  ns,
+			Name:       depName,
+			APIVersion: "apps/v1",
+		}
+
+		// Resolve effective injection annotation (template overrides deployment)
 		annotations := dep.GetAnnotations()
 		sidecarInject := annotations["sidecar.istio.io/inject"]
-
-		// Check template annotations
 		templateAnnotations, _, _ := unstructured.NestedStringMap(dep.Object, "spec", "template", "metadata", "annotations")
 		if templateAnnotations["sidecar.istio.io/inject"] != "" {
 			sidecarInject = templateAnnotations["sidecar.istio.io/inject"]
 		}
 
 		// Check if pods actually have istio-proxy container
-		selector, _, _ := unstructured.NestedMap(dep.Object, "spec", "selector", "matchLabels")
-		hasSidecar := false
-		if len(selector) > 0 {
-			labelSelector := ""
-			for k, v := range selector {
-				if labelSelector != "" {
-					labelSelector += ","
-				}
-				if vs, ok := v.(string); ok {
-					labelSelector += k + "=" + vs
-				}
-			}
-			podList, podErr := t.Clients.Dynamic.Resource(podsGVR).Namespace(ns).List(ctx, metav1.ListOptions{
-				LabelSelector: labelSelector,
-				Limit:         1,
-			})
-			if podErr == nil && len(podList.Items) > 0 {
-				containers, _, _ := unstructured.NestedSlice(podList.Items[0].Object, "spec", "containers")
-				for _, c := range containers {
-					if cm, ok := c.(map[string]interface{}); ok {
-						if name, ok := cm["name"].(string); ok && name == "istio-proxy" {
-							hasSidecar = true
-							break
-						}
-					}
-				}
+		hasSidecar := checkPodHasSidecar(ctx, t.Clients.Dynamic, ns, dep.Object)
+
+		// Determine injection status
+		injectionExpected := sidecarInject == "true" || (sidecarInject == "" && nsInjectionEnabled)
+
+		var status string
+		var severity string
+		var suggestion string
+
+		switch {
+		case hasSidecar:
+			status = "injected"
+			severity = types.SeverityOK
+		case injectionExpected && !hasSidecar:
+			status = "pending"
+			severity = types.SeverityWarning
+			suggestion = "Sidecar injection is expected but not present; try restarting the deployment to trigger injection"
+		default:
+			status = "missing"
+			if nsInjectionEnabled && sidecarInject == "false" {
+				severity = types.SeverityInfo
+				suggestion = "Injection is explicitly disabled via annotation sidecar.istio.io/inject=false"
+			} else {
+				severity = types.SeverityInfo
 			}
 		}
 
-		deployments = append(deployments, map[string]interface{}{
-			"name":                    dep.GetName(),
-			"sidecarInjectAnnotation": sidecarInject,
-			"hasSidecar":              hasSidecar,
+		detail := fmt.Sprintf("namespace-injection=%s annotation=%q sidecar-present=%v",
+			nsInjectionLabel, sidecarInject, hasSidecar)
+
+		findings = append(findings, types.DiagnosticFinding{
+			Severity:   severity,
+			Category:   types.CategoryMesh,
+			Resource:   depRef,
+			Summary:    fmt.Sprintf("Deployment %s/%s injection=%s", ns, depName, status),
+			Detail:     detail,
+			Suggestion: suggestion,
 		})
 	}
 
-	return NewResponse(t.Cfg, t.Name(), map[string]interface{}{
-		"namespace":          ns,
-		"namespaceInjection": nsInjectionLabel,
-		"deploymentCount":    len(deployments),
-		"deployments":        deployments,
-	}), nil
+	return NewToolResultResponse(t.Cfg, t.Name(), findings, ns, "istio"), nil
+}
+
+// checkPodHasSidecar checks if a deployment's pods have the istio-proxy container.
+func checkPodHasSidecar(ctx context.Context, client dynamic.Interface, ns string, depObj map[string]interface{}) bool {
+	selector, _, _ := unstructured.NestedMap(depObj, "spec", "selector", "matchLabels")
+	if len(selector) == 0 {
+		return false
+	}
+	labelParts := make([]string, 0, len(selector))
+	for k, v := range selector {
+		if vs, ok := v.(string); ok {
+			labelParts = append(labelParts, k+"="+vs)
+		}
+	}
+	podList, podErr := client.Resource(podsGVR).Namespace(ns).List(ctx, metav1.ListOptions{
+		LabelSelector: strings.Join(labelParts, ","),
+		Limit:         1,
+	})
+	if podErr != nil || len(podList.Items) == 0 {
+		return false
+	}
+	containers, _, _ := unstructured.NestedSlice(podList.Items[0].Object, "spec", "containers")
+	for _, c := range containers {
+		if cm, ok := c.(map[string]interface{}); ok {
+			if name, ok := cm["name"].(string); ok && name == "istio-proxy" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // --- check_istio_mtls ---
 
 type CheckIstioMTLSTool struct{ BaseTool }
 
-func (t *CheckIstioMTLSTool) Name() string        { return "check_istio_mtls" }
-func (t *CheckIstioMTLSTool) Description() string  { return "Check mTLS mode per namespace: PeerAuthentication policies and DestinationRule TLS settings" }
+func (t *CheckIstioMTLSTool) Name() string { return "check_istio_mtls" }
+func (t *CheckIstioMTLSTool) Description() string {
+	return "Check mTLS configuration: PeerAuthentication policies, DestinationRule TLS settings, and detect STRICT/DISABLE conflicts"
+}
 func (t *CheckIstioMTLSTool) InputSchema() map[string]interface{} {
 	return map[string]interface{}{
 		"type": "object",
@@ -458,41 +531,140 @@ func (t *CheckIstioMTLSTool) Run(ctx context.Context, args map[string]interface{
 	// Get PeerAuthentication policies (v1/v1beta1 fallback)
 	paList, err := listWithFallback(ctx, t.Clients.Dynamic, paV1GVR, paV1B1GVR, ns)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list PeerAuthentication: %w", err)
-	}
-
-	paPolicies := make([]map[string]interface{}, 0, len(paList.Items))
-	for _, item := range paList.Items {
-		mode, _, _ := unstructured.NestedString(item.Object, "spec", "mtls", "mode")
-		selector, _, _ := unstructured.NestedMap(item.Object, "spec", "selector")
-		paPolicies = append(paPolicies, map[string]interface{}{
-			"name":      item.GetName(),
-			"namespace": item.GetNamespace(),
-			"mtlsMode":  mode,
-			"selector":  selector,
-		})
+		return nil, &types.MCPError{
+			Code:    types.ErrCodeCRDNotAvailable,
+			Tool:    t.Name(),
+			Message: "failed to list PeerAuthentication",
+			Detail:  fmt.Sprintf("tried security.istio.io v1 and v1beta1: %v", err),
+		}
 	}
 
 	// Get DestinationRule TLS settings (v1/v1beta1 fallback)
 	drList, err := listWithFallback(ctx, t.Clients.Dynamic, drV1GVR, drV1B1GVR, ns)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list DestinationRule: %w", err)
+		return nil, &types.MCPError{
+			Code:    types.ErrCodeCRDNotAvailable,
+			Tool:    t.Name(),
+			Message: "failed to list DestinationRule",
+			Detail:  fmt.Sprintf("tried networking.istio.io v1 and v1beta1: %v", err),
+		}
 	}
 
-	drPolicies := make([]map[string]interface{}, 0, len(drList.Items))
-	for _, item := range drList.Items {
-		host, _, _ := unstructured.NestedString(item.Object, "spec", "host")
-		tlsMode, _, _ := unstructured.NestedString(item.Object, "spec", "trafficPolicy", "tls", "mode")
-		drPolicies = append(drPolicies, map[string]interface{}{
-			"name":      item.GetName(),
-			"namespace": item.GetNamespace(),
-			"host":      host,
-			"tlsMode":   tlsMode,
+	var findings []types.DiagnosticFinding
+
+	// Track namespace-wide PeerAuthentication modes for conflict detection
+	// key: namespace -> effective mTLS mode
+	nsMtlsModes := make(map[string]string)
+
+	// PeerAuthentication findings
+	for _, item := range paList.Items {
+		paNs := item.GetNamespace()
+		paName := item.GetName()
+		mode, _, _ := unstructured.NestedString(item.Object, "spec", "mtls", "mode")
+		if mode == "" {
+			mode = "UNSET"
+		}
+		selector, _, _ := unstructured.NestedMap(item.Object, "spec", "selector", "matchLabels")
+
+		ref := &types.ResourceRef{
+			Kind:       "PeerAuthentication",
+			Namespace:  paNs,
+			Name:       paName,
+			APIVersion: "security.istio.io",
+		}
+
+		scope := "namespace-wide"
+		if len(selector) > 0 {
+			labelParts := make([]string, 0, len(selector))
+			for k, v := range selector {
+				if vs, ok := v.(string); ok {
+					labelParts = append(labelParts, fmt.Sprintf("%s=%s", k, vs))
+				}
+			}
+			sort.Strings(labelParts)
+			scope = fmt.Sprintf("selector={%s}", strings.Join(labelParts, ", "))
+		} else {
+			// Namespace-wide policy — track for conflict detection
+			nsMtlsModes[paNs] = mode
+		}
+
+		// Mesh-wide policy (istio-system namespace, no selector)
+		if paNs == "istio-system" && len(selector) == 0 {
+			scope = "mesh-wide"
+		}
+
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: types.SeverityInfo,
+			Category: types.CategoryTLS,
+			Resource: ref,
+			Summary:  fmt.Sprintf("PeerAuthentication %s/%s mtls=%s (%s)", paNs, paName, mode, scope),
 		})
 	}
 
-	return NewResponse(t.Cfg, t.Name(), map[string]interface{}{
-		"peerAuthentications": paPolicies,
-		"destinationRules":    drPolicies,
-	}), nil
+	// DestinationRule findings + conflict detection
+	for _, item := range drList.Items {
+		drNs := item.GetNamespace()
+		drName := item.GetName()
+		host, _, _ := unstructured.NestedString(item.Object, "spec", "host")
+		tlsMode, _, _ := unstructured.NestedString(item.Object, "spec", "trafficPolicy", "tls", "mode")
+
+		ref := &types.ResourceRef{
+			Kind:       "DestinationRule",
+			Namespace:  drNs,
+			Name:       drName,
+			APIVersion: "networking.istio.io",
+		}
+
+		if tlsMode == "" {
+			// No explicit TLS mode — informational only
+			findings = append(findings, types.DiagnosticFinding{
+				Severity: types.SeverityInfo,
+				Category: types.CategoryTLS,
+				Resource: ref,
+				Summary:  fmt.Sprintf("DestinationRule %s/%s host=%s tls=<not set>", drNs, drName, host),
+			})
+			continue
+		}
+
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: types.SeverityInfo,
+			Category: types.CategoryTLS,
+			Resource: ref,
+			Summary:  fmt.Sprintf("DestinationRule %s/%s host=%s tls=%s", drNs, drName, host, tlsMode),
+		})
+
+		// Conflict detection: PeerAuthentication STRICT vs DestinationRule DISABLE
+		if tlsMode == "DISABLE" {
+			// Check if any PeerAuthentication enforces STRICT for this namespace
+			effectivePA := nsMtlsModes[drNs]
+			// Also check mesh-wide policy
+			if effectivePA == "" {
+				effectivePA = nsMtlsModes["istio-system"]
+			}
+
+			if effectivePA == "STRICT" {
+				findings = append(findings, types.DiagnosticFinding{
+					Severity: types.SeverityCritical,
+					Category: types.CategoryTLS,
+					Resource: ref,
+					Summary: fmt.Sprintf("CONFLICT: DestinationRule %s/%s disables TLS for host %s but PeerAuthentication enforces STRICT mTLS",
+						drNs, drName, host),
+					Detail: fmt.Sprintf("PeerAuthentication in namespace %s sets mtls=STRICT, but DestinationRule %s/%s sets trafficPolicy.tls.mode=DISABLE for host %s. "+
+						"This will cause connection failures — clients will send plaintext but the server requires mTLS.",
+						drNs, drNs, drName, host),
+					Suggestion: "Either change the DestinationRule TLS mode to ISTIO_MUTUAL, or relax the PeerAuthentication to PERMISSIVE",
+				})
+			}
+		}
+	}
+
+	if len(findings) == 0 {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: types.SeverityInfo,
+			Category: types.CategoryTLS,
+			Summary:  "No PeerAuthentication or DestinationRule TLS policies found; Istio defaults apply",
+		})
+	}
+
+	return NewToolResultResponse(t.Cfg, t.Name(), findings, ns, "istio"), nil
 }
