@@ -20,6 +20,8 @@ var (
 	httpRoutesV1B1GVR = schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1beta1", Resource: "httproutes"}
 	grpcRoutesV1GVR   = schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "grpcroutes"}
 	grpcRoutesV1B1GVR = schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1beta1", Resource: "grpcroutes"}
+	refGrantsV1B1GVR  = schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1beta1", Resource: "referencegrants"}
+	refGrantsV1GVR    = schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "referencegrants"}
 )
 
 // listWithFallback tries listing with the v1 GVR first, falling back to v1beta1.
@@ -985,6 +987,246 @@ func (t *GetGRPCRouteTool) Run(ctx context.Context, args map[string]interface{})
 						Detail:     message,
 						Suggestion: "Check that the parent gateway and listener accept this GRPCRoute",
 					})
+				}
+			}
+		}
+	}
+
+	return NewToolResultResponse(t.Cfg, t.Name(), findings, ns, "gateway-api"), nil
+}
+
+// --- list_referencegrants ---
+
+type ListReferenceGrantsTool struct{ BaseTool }
+
+func (t *ListReferenceGrantsTool) Name() string        { return "list_referencegrants" }
+func (t *ListReferenceGrantsTool) Description() string  { return "List ReferenceGrants with from/to resource specifications for cross-namespace reference validation" }
+func (t *ListReferenceGrantsTool) InputSchema() map[string]interface{} {
+	return map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"namespace": map[string]interface{}{
+				"type":        "string",
+				"description": "Kubernetes namespace (empty for all namespaces)",
+			},
+		},
+	}
+}
+
+func (t *ListReferenceGrantsTool) Run(ctx context.Context, args map[string]interface{}) (*StandardResponse, error) {
+	ns := getStringArg(args, "namespace", "")
+
+	list, err := listWithFallback(ctx, t.Clients.Dynamic, refGrantsV1GVR, refGrantsV1B1GVR, ns)
+	if err != nil {
+		return nil, &types.MCPError{
+			Code:    types.ErrCodeCRDNotAvailable,
+			Tool:    t.Name(),
+			Message: "failed to list referencegrants",
+			Detail:  fmt.Sprintf("tried gateway.networking.k8s.io/v1 and v1beta1: %v", err),
+		}
+	}
+
+	findings := make([]types.DiagnosticFinding, 0, len(list.Items))
+	for _, item := range list.Items {
+		fromRefs, _, _ := unstructured.NestedSlice(item.Object, "spec", "from")
+		toRefs, _, _ := unstructured.NestedSlice(item.Object, "spec", "to")
+
+		fromParts := make([]string, 0, len(fromRefs))
+		for _, f := range fromRefs {
+			if fm, ok := f.(map[string]interface{}); ok {
+				group, _ := fm["group"].(string)
+				kind, _ := fm["kind"].(string)
+				namespace, _ := fm["namespace"].(string)
+				fromParts = append(fromParts, fmt.Sprintf("%s/%s from ns=%s", group, kind, namespace))
+			}
+		}
+
+		toParts := make([]string, 0, len(toRefs))
+		for _, t := range toRefs {
+			if tm, ok := t.(map[string]interface{}); ok {
+				group, _ := tm["group"].(string)
+				kind, _ := tm["kind"].(string)
+				name, _ := tm["name"].(string)
+				part := fmt.Sprintf("%s/%s", group, kind)
+				if name != "" {
+					part += fmt.Sprintf(" name=%s", name)
+				}
+				toParts = append(toParts, part)
+			}
+		}
+
+		summary := fmt.Sprintf("%s/%s from=[%s] to=[%s]",
+			item.GetNamespace(), item.GetName(),
+			strings.Join(fromParts, "; "),
+			strings.Join(toParts, "; "))
+
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: types.SeverityInfo,
+			Category: types.CategoryPolicy,
+			Resource: &types.ResourceRef{
+				Kind:       "ReferenceGrant",
+				Namespace:  item.GetNamespace(),
+				Name:       item.GetName(),
+				APIVersion: "gateway.networking.k8s.io",
+			},
+			Summary: summary,
+		})
+	}
+
+	return NewToolResultResponse(t.Cfg, t.Name(), findings, ns, "gateway-api"), nil
+}
+
+// --- get_referencegrant ---
+
+type GetReferenceGrantTool struct{ BaseTool }
+
+func (t *GetReferenceGrantTool) Name() string        { return "get_referencegrant" }
+func (t *GetReferenceGrantTool) Description() string  { return "Get full ReferenceGrant spec: allowed from-namespaces, from-kinds, to-kinds, to-names, and cross-namespace validation" }
+func (t *GetReferenceGrantTool) InputSchema() map[string]interface{} {
+	return map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"name": map[string]interface{}{
+				"type":        "string",
+				"description": "ReferenceGrant name",
+			},
+			"namespace": map[string]interface{}{
+				"type":        "string",
+				"description": "Kubernetes namespace (the namespace that grants access)",
+			},
+		},
+		"required": []string{"name", "namespace"},
+	}
+}
+
+func (t *GetReferenceGrantTool) Run(ctx context.Context, args map[string]interface{}) (*StandardResponse, error) {
+	name := getStringArg(args, "name", "")
+	ns := getStringArg(args, "namespace", "default")
+
+	grant, err := getWithFallback(ctx, t.Clients.Dynamic, refGrantsV1GVR, refGrantsV1B1GVR, ns, name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get referencegrant %s/%s: %w", ns, name, err)
+	}
+
+	grantRef := &types.ResourceRef{
+		Kind:       "ReferenceGrant",
+		Namespace:  ns,
+		Name:       name,
+		APIVersion: "gateway.networking.k8s.io",
+	}
+
+	fromRefs, _, _ := unstructured.NestedSlice(grant.Object, "spec", "from")
+	toRefs, _, _ := unstructured.NestedSlice(grant.Object, "spec", "to")
+
+	var findings []types.DiagnosticFinding
+
+	// Build detailed from/to descriptions
+	fromParts := make([]string, 0, len(fromRefs))
+	for _, f := range fromRefs {
+		if fm, ok := f.(map[string]interface{}); ok {
+			group, _ := fm["group"].(string)
+			kind, _ := fm["kind"].(string)
+			namespace, _ := fm["namespace"].(string)
+			if group == "" {
+				group = "core"
+			}
+			fromParts = append(fromParts, fmt.Sprintf("%s/%s from namespace %s", group, kind, namespace))
+		}
+	}
+
+	toParts := make([]string, 0, len(toRefs))
+	for _, tr := range toRefs {
+		if tm, ok := tr.(map[string]interface{}); ok {
+			group, _ := tm["group"].(string)
+			kind, _ := tm["kind"].(string)
+			toName, _ := tm["name"].(string)
+			if group == "" {
+				group = "core"
+			}
+			part := fmt.Sprintf("%s/%s", group, kind)
+			if toName != "" {
+				part += fmt.Sprintf(" name=%s", toName)
+			}
+			toParts = append(toParts, part)
+		}
+	}
+
+	// Main grant finding
+	findings = append(findings, types.DiagnosticFinding{
+		Severity: types.SeverityInfo,
+		Category: types.CategoryPolicy,
+		Resource: grantRef,
+		Summary:  fmt.Sprintf("ReferenceGrant %s/%s allows %d source(s) to reference %d target(s) in namespace %s", ns, name, len(fromRefs), len(toRefs), ns),
+		Detail:   fmt.Sprintf("from:\n  %s\nto:\n  %s", strings.Join(fromParts, "\n  "), strings.Join(toParts, "\n  ")),
+	})
+
+	// Check for HTTPRoutes that reference backends in this namespace from allowed source namespaces
+	// and identify any cross-namespace references that are NOT covered by this grant
+	allowedFromNamespaces := make(map[string]bool)
+	for _, f := range fromRefs {
+		if fm, ok := f.(map[string]interface{}); ok {
+			fromNs, _ := fm["namespace"].(string)
+			fromKind, _ := fm["kind"].(string)
+			if fromKind == "HTTPRoute" || fromKind == "GRPCRoute" {
+				allowedFromNamespaces[fromNs] = true
+			}
+		}
+	}
+
+	// Find HTTPRoutes that reference backends in this grant's namespace
+	routeList, _ := listWithFallback(ctx, t.Clients.Dynamic, httpRoutesV1GVR, httpRoutesV1B1GVR, "")
+	if routeList != nil {
+		for _, route := range routeList.Items {
+			routeNs := route.GetNamespace()
+			if routeNs == ns {
+				continue // same namespace, no grant needed
+			}
+			rules, _, _ := unstructured.NestedSlice(route.Object, "spec", "rules")
+			for _, r := range rules {
+				rm, ok := r.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				brs, ok := rm["backendRefs"].([]interface{})
+				if !ok {
+					continue
+				}
+				for _, br := range brs {
+					brm, ok := br.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					refNs, _ := brm["namespace"].(string)
+					refName, _ := brm["name"].(string)
+					if refNs != ns {
+						continue // backend not in this grant's namespace
+					}
+					if allowedFromNamespaces[routeNs] {
+						findings = append(findings, types.DiagnosticFinding{
+							Severity: types.SeverityOK,
+							Category: types.CategoryPolicy,
+							Resource: &types.ResourceRef{
+								Kind:       "HTTPRoute",
+								Namespace:  routeNs,
+								Name:       route.GetName(),
+								APIVersion: "gateway.networking.k8s.io",
+							},
+							Summary: fmt.Sprintf("HTTPRoute %s/%s cross-namespace ref to %s/%s is allowed by ReferenceGrant %s/%s", routeNs, route.GetName(), ns, refName, ns, name),
+						})
+					} else {
+						findings = append(findings, types.DiagnosticFinding{
+							Severity:   types.SeverityWarning,
+							Category:   types.CategoryPolicy,
+							Resource: &types.ResourceRef{
+								Kind:       "HTTPRoute",
+								Namespace:  routeNs,
+								Name:       route.GetName(),
+								APIVersion: "gateway.networking.k8s.io",
+							},
+							Summary:    fmt.Sprintf("HTTPRoute %s/%s references backend %s/%s but namespace %s is not allowed by ReferenceGrant %s/%s", routeNs, route.GetName(), ns, refName, routeNs, ns, name),
+							Suggestion: fmt.Sprintf("Add namespace %s to the ReferenceGrant 'from' list, or create a new ReferenceGrant in namespace %s", routeNs, ns),
+						})
+					}
 				}
 			}
 		}

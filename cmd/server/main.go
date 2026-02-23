@@ -69,7 +69,7 @@ func main() {
 	srv := mcpserver.NewServer(registry)
 
 	// Gateway API tool names for conditional registration
-	gatewayToolNames := []string{"list_gateways", "get_gateway", "list_httproutes", "get_httproute", "list_grpcroutes", "get_grpcroute"}
+	gatewayToolNames := []string{"list_gateways", "get_gateway", "list_httproutes", "get_httproute", "list_grpcroutes", "get_grpcroute", "list_referencegrants", "get_referencegrant"}
 	istioToolNames := []string{"list_istio_resources", "get_istio_resource", "check_sidecar_injection", "check_istio_mtls"}
 
 	// CRD discovery with onChange callback
@@ -83,6 +83,8 @@ func main() {
 			registry.Register(&tools.GetHTTPRouteTool{BaseTool: base})
 			registry.Register(&tools.ListGRPCRoutesTool{BaseTool: base})
 			registry.Register(&tools.GetGRPCRouteTool{BaseTool: base})
+			registry.Register(&tools.ListReferenceGrantsTool{BaseTool: base})
+			registry.Register(&tools.GetReferenceGrantTool{BaseTool: base})
 		} else {
 			for _, name := range gatewayToolNames {
 				registry.Unregister(name)
