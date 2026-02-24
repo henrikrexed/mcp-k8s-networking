@@ -99,10 +99,10 @@ development_status:
   # ============================================================
   # Epic 6: Active Diagnostic Probing
   # ============================================================
-  epic-6: backlog
-  6-1-ephemeral-pod-manager: backlog
-  6-2-network-connectivity-and-dns-probes: backlog
-  6-3-http-service-probes: backlog
+  epic-6: done
+  6-1-ephemeral-pod-manager: done
+  6-2-network-connectivity-and-dns-probes: done
+  6-3-http-service-probes: done
   epic-6-retrospective: optional
 
   # ============================================================

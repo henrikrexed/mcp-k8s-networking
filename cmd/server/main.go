@@ -14,6 +14,7 @@ import (
 	"github.com/isitobservable/k8s-networking-mcp/pkg/discovery"
 	"github.com/isitobservable/k8s-networking-mcp/pkg/k8s"
 	mcpserver "github.com/isitobservable/k8s-networking-mcp/pkg/mcp"
+	"github.com/isitobservable/k8s-networking-mcp/pkg/probes"
 	"github.com/isitobservable/k8s-networking-mcp/pkg/telemetry"
 	"github.com/isitobservable/k8s-networking-mcp/pkg/tools"
 )
@@ -64,6 +65,12 @@ func main() {
 	registry.Register(&tools.GetGatewayLogsTool{BaseTool: base})
 	registry.Register(&tools.GetInfraLogsTool{BaseTool: base})
 	registry.Register(&tools.AnalyzeLogErrorsTool{BaseTool: base})
+
+	// Initialize probe manager and register probe tools (always available)
+	probeMgr := probes.NewManager(context.Background(), cfg, clients)
+	registry.Register(&tools.ProbeConnectivityTool{BaseTool: base, ProbeManager: probeMgr})
+	registry.Register(&tools.ProbeDNSTool{BaseTool: base, ProbeManager: probeMgr})
+	registry.Register(&tools.ProbeHTTPTool{BaseTool: base, ProbeManager: probeMgr})
 
 	// Create MCP server
 	srv := mcpserver.NewServer(registry)
@@ -176,6 +183,8 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.Error("shutdown error", "error", err)
 	}
+
+	probeMgr.Stop()
 
 	// Flush pending OTel spans before exit
 	if err := tracerShutdown(shutdownCtx); err != nil {
