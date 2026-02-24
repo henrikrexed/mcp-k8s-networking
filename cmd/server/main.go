@@ -15,6 +15,7 @@ import (
 	"github.com/isitobservable/k8s-networking-mcp/pkg/k8s"
 	mcpserver "github.com/isitobservable/k8s-networking-mcp/pkg/mcp"
 	"github.com/isitobservable/k8s-networking-mcp/pkg/probes"
+	"github.com/isitobservable/k8s-networking-mcp/pkg/skills"
 	"github.com/isitobservable/k8s-networking-mcp/pkg/telemetry"
 	"github.com/isitobservable/k8s-networking-mcp/pkg/tools"
 )
@@ -71,6 +72,13 @@ func main() {
 	registry.Register(&tools.ProbeConnectivityTool{BaseTool: base, ProbeManager: probeMgr})
 	registry.Register(&tools.ProbeDNSTool{BaseTool: base, ProbeManager: probeMgr})
 	registry.Register(&tools.ProbeHTTPTool{BaseTool: base, ProbeManager: probeMgr})
+
+	// Create skills registry
+	skillsRegistry := skills.NewRegistry()
+
+	// Register skill tools (always available, content varies by features)
+	registry.Register(&tools.ListSkillsTool{BaseTool: base, Registry: skillsRegistry})
+	registry.Register(&tools.RunSkillTool{BaseTool: base, Registry: skillsRegistry})
 
 	// Create MCP server
 	srv := mcpserver.NewServer(registry)
@@ -185,6 +193,9 @@ func main() {
 				registry.Unregister(name)
 			}
 		}
+
+		// Sync skills registry with discovered features
+		skillsRegistry.SyncWithFeatures(features, cfg, clients)
 
 		// Re-sync tools with MCP server
 		srv.SyncTools()

@@ -148,12 +148,12 @@ development_status:
   # ============================================================
   # Epic 11: Agent Skills for Networking Configuration
   # ============================================================
-  epic-11: backlog
-  11-1-skills-framework-and-registry: backlog
-  11-2-expose-service-via-gateway-api-skill: backlog
-  11-3-configure-istio-mtls-skill: backlog
-  11-4-configure-traffic-splitting-skill: backlog
-  11-5-create-networkpolicy-skill: backlog
+  epic-11: done
+  11-1-skills-framework-and-registry: done
+  11-2-expose-service-via-gateway-api-skill: done
+  11-3-configure-istio-mtls-skill: done
+  11-4-configure-traffic-splitting-skill: done
+  11-5-create-networkpolicy-skill: done
   epic-11-retrospective: optional
 
   # ============================================================
