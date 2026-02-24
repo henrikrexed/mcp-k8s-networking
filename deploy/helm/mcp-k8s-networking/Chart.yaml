@@ -1,0 +1,19 @@
+apiVersion: v2
+name: mcp-k8s-networking
+description: MCP server for Kubernetes networking diagnostics
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - kubernetes
+  - networking
+  - mcp
+  - diagnostics
+  - gateway-api
+  - istio
+  - service-mesh
+home: https://github.com/isitobservable/k8s-networking-mcp
+sources:
+  - https://github.com/isitobservable/k8s-networking-mcp
+maintainers:
+  - name: isitobservable

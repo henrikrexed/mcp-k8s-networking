@@ -129,10 +129,10 @@ development_status:
   # ============================================================
   # Epic 9: Production Deployment — Helm Chart & Gateway API
   # ============================================================
-  epic-9: backlog
-  9-1-helm-chart-foundation: backlog
-  9-2-gateway-api-httproute-exposure: backlog
-  9-3-update-raw-yaml-manifests: backlog
+  epic-9: done
+  9-1-helm-chart-foundation: done
+  9-2-gateway-api-httproute-exposure: done
+  9-3-update-raw-yaml-manifests: done
   epic-9-retrospective: optional
 
   # ============================================================

@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mcp-k8s-networking.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "mcp-k8s-networking.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "mcp-k8s-networking.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mcp-k8s-networking.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "mcp-k8s-networking.serviceAccountName" . }}
+      containers:
+        - name: mcp-k8s-networking
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.config.port }}
+              name: mcp
+            - containerPort: {{ add .Values.config.port 1 }}
+              name: health
+          env:
+            - name: CLUSTER_NAME
+              value: {{ required "config.clusterName is required" .Values.config.clusterName | quote }}
+            - name: PORT
+              value: {{ .Values.config.port | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.config.logLevel | quote }}
+            {{- if .Values.config.namespace }}
+            - name: NAMESPACE
+              value: {{ .Values.config.namespace | quote }}
+            {{- end }}
+            - name: CACHE_TTL
+              value: {{ .Values.config.cacheTTL | quote }}
+            - name: TOOL_TIMEOUT
+              value: {{ .Values.config.toolTimeout | quote }}
+            - name: PROBE_NAMESPACE
+              value: {{ .Values.probe.namespace | quote }}
+            - name: PROBE_IMAGE
+              value: {{ .Values.probe.image | quote }}
+            - name: MAX_CONCURRENT_PROBES
+              value: {{ .Values.probe.maxConcurrent | quote }}
+            {{- if .Values.otel.enabled }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.otel.endpoint | quote }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
