@@ -108,11 +108,11 @@ development_status:
   # ============================================================
   # Epic 7: CRD-Aware Design Guidance & Remediation
   # ============================================================
-  epic-7: backlog
-  7-1-gateway-api-design-guidance: backlog
-  7-2-istio-design-guidance: backlog
-  7-3-kgateway-design-guidance: backlog
-  7-4-diagnostic-remediation-suggestions: backlog
+  epic-7: done
+  7-1-gateway-api-design-guidance: done
+  7-2-istio-design-guidance: done
+  7-3-kgateway-design-guidance: done
+  7-4-diagnostic-remediation-suggestions: done
   epic-7-retrospective: optional
 
   # ============================================================

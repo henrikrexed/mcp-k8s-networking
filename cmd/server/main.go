@@ -75,11 +75,14 @@ func main() {
 	// Create MCP server
 	srv := mcpserver.NewServer(registry)
 
-	// Gateway API tool names for conditional registration
-	gatewayToolNames := []string{"list_gateways", "get_gateway", "list_httproutes", "get_httproute", "list_grpcroutes", "get_grpcroute", "list_referencegrants", "get_referencegrant", "scan_gateway_misconfigs", "check_gateway_conformance"}
-	istioToolNames := []string{"list_istio_resources", "get_istio_resource", "check_sidecar_injection", "check_istio_mtls", "validate_istio_config", "analyze_istio_authpolicy", "analyze_istio_routing"}
+	// Register remediation tool (always available)
+	registry.Register(&tools.SuggestRemediationTool{BaseTool: base})
 
-	kgatewayToolNames := []string{"list_kgateway_resources", "validate_kgateway_resource", "check_kgateway_health"}
+	// Gateway API tool names for conditional registration
+	gatewayToolNames := []string{"list_gateways", "get_gateway", "list_httproutes", "get_httproute", "list_grpcroutes", "get_grpcroute", "list_referencegrants", "get_referencegrant", "scan_gateway_misconfigs", "check_gateway_conformance", "design_gateway_api"}
+	istioToolNames := []string{"list_istio_resources", "get_istio_resource", "check_sidecar_injection", "check_istio_mtls", "validate_istio_config", "analyze_istio_authpolicy", "analyze_istio_routing", "design_istio"}
+
+	kgatewayToolNames := []string{"list_kgateway_resources", "validate_kgateway_resource", "check_kgateway_health", "design_kgateway"}
 
 	// CRD discovery with onChange callback
 	disc := discovery.New(clients.Discovery, clients.Dynamic, func(features discovery.Features) {
@@ -96,6 +99,7 @@ func main() {
 			registry.Register(&tools.GetReferenceGrantTool{BaseTool: base})
 			registry.Register(&tools.ScanGatewayMisconfigsTool{BaseTool: base})
 			registry.Register(&tools.CheckGatewayConformanceTool{BaseTool: base})
+			registry.Register(&tools.DesignGatewayAPITool{BaseTool: base})
 		} else {
 			for _, name := range gatewayToolNames {
 				registry.Unregister(name)
@@ -111,6 +115,7 @@ func main() {
 			registry.Register(&tools.ValidateIstioConfigTool{BaseTool: base})
 			registry.Register(&tools.AnalyzeIstioAuthPolicyTool{BaseTool: base})
 			registry.Register(&tools.AnalyzeIstioRoutingTool{BaseTool: base})
+			registry.Register(&tools.DesignIstioTool{BaseTool: base})
 		} else {
 			for _, name := range istioToolNames {
 				registry.Unregister(name)
@@ -122,6 +127,7 @@ func main() {
 			registry.Register(&tools.ListKgatewayResourcesTool{BaseTool: base})
 			registry.Register(&tools.ValidateKgatewayResourceTool{BaseTool: base})
 			registry.Register(&tools.CheckKgatewayHealthTool{BaseTool: base})
+			registry.Register(&tools.DesignKgatewayTool{BaseTool: base})
 		} else {
 			for _, name := range kgatewayToolNames {
 				registry.Unregister(name)
