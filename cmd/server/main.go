@@ -83,6 +83,11 @@ func main() {
 	istioToolNames := []string{"list_istio_resources", "get_istio_resource", "check_sidecar_injection", "check_istio_mtls", "validate_istio_config", "analyze_istio_authpolicy", "analyze_istio_routing", "design_istio"}
 
 	kgatewayToolNames := []string{"list_kgateway_resources", "validate_kgateway_resource", "check_kgateway_health", "design_kgateway"}
+	kumaToolNames := []string{"check_kuma_status"}
+	linkerdToolNames := []string{"check_linkerd_status"}
+	ciliumToolNames := []string{"list_cilium_policies", "check_cilium_status"}
+	calicoToolNames := []string{"list_calico_policies", "check_calico_status"}
+	flannelToolNames := []string{"check_flannel_status"}
 
 	// CRD discovery with onChange callback
 	disc := discovery.New(clients.Discovery, clients.Dynamic, func(features discovery.Features) {
@@ -130,6 +135,53 @@ func main() {
 			registry.Register(&tools.DesignKgatewayTool{BaseTool: base})
 		} else {
 			for _, name := range kgatewayToolNames {
+				registry.Unregister(name)
+			}
+		}
+
+		// Kuma tools
+		if features.HasKuma {
+			registry.Register(&tools.CheckKumaStatusTool{BaseTool: base})
+		} else {
+			for _, name := range kumaToolNames {
+				registry.Unregister(name)
+			}
+		}
+
+		// Linkerd tools
+		if features.HasLinkerd {
+			registry.Register(&tools.CheckLinkerdStatusTool{BaseTool: base})
+		} else {
+			for _, name := range linkerdToolNames {
+				registry.Unregister(name)
+			}
+		}
+
+		// Cilium tools
+		if features.HasCilium {
+			registry.Register(&tools.ListCiliumPoliciesTool{BaseTool: base})
+			registry.Register(&tools.CheckCiliumStatusTool{BaseTool: base})
+		} else {
+			for _, name := range ciliumToolNames {
+				registry.Unregister(name)
+			}
+		}
+
+		// Calico tools
+		if features.HasCalico {
+			registry.Register(&tools.ListCalicoPoliciesTool{BaseTool: base})
+			registry.Register(&tools.CheckCalicoStatusTool{BaseTool: base})
+		} else {
+			for _, name := range calicoToolNames {
+				registry.Unregister(name)
+			}
+		}
+
+		// Flannel tools
+		if features.HasFlannel {
+			registry.Register(&tools.CheckFlannelStatusTool{BaseTool: base})
+		} else {
+			for _, name := range flannelToolNames {
 				registry.Unregister(name)
 			}
 		}

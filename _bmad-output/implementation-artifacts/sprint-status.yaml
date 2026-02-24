@@ -118,12 +118,12 @@ development_status:
   # ============================================================
   # Epic 8: Tier 2 Provider Support
   # ============================================================
-  epic-8: backlog
-  8-1-kuma-basic-diagnostics: backlog
-  8-2-linkerd-basic-diagnostics: backlog
-  8-3-cilium-networkpolicy-and-connectivity-diagnostics: backlog
-  8-4-calico-networkpolicy-diagnostics: backlog
-  8-5-flannel-detection-and-health: backlog
+  epic-8: done
+  8-1-kuma-basic-diagnostics: done
+  8-2-linkerd-basic-diagnostics: done
+  8-3-cilium-networkpolicy-and-connectivity-diagnostics: done
+  8-4-calico-networkpolicy-diagnostics: done
+  8-5-flannel-detection-and-health: done
   epic-8-retrospective: optional
 
   # ============================================================
