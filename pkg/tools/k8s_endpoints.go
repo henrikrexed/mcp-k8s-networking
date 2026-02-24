@@ -6,6 +6,8 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+
+	"github.com/isitobservable/k8s-networking-mcp/pkg/types"
 )
 
 // --- list_endpoints ---
@@ -40,7 +42,7 @@ func (t *ListEndpointsTool) Run(ctx context.Context, args map[string]interface{}
 		return nil, fmt.Errorf("failed to list endpoints: %w", err)
 	}
 
-	endpoints := make([]map[string]interface{}, 0, len(list.Items))
+	findings := make([]types.DiagnosticFinding, 0, len(list.Items))
 	for _, item := range list.Items {
 		subsets, _, _ := unstructured.NestedSlice(item.Object, "subsets")
 		readyCount := 0
@@ -56,16 +58,25 @@ func (t *ListEndpointsTool) Run(ctx context.Context, args map[string]interface{}
 			}
 		}
 
-		endpoints = append(endpoints, map[string]interface{}{
-			"name":              item.GetName(),
-			"namespace":         item.GetNamespace(),
-			"readyAddresses":    readyCount,
-			"notReadyAddresses": notReadyCount,
+		severity := types.SeverityOK
+		if readyCount == 0 && notReadyCount > 0 {
+			severity = types.SeverityWarning
+		} else if readyCount == 0 && notReadyCount == 0 {
+			severity = types.SeverityInfo
+		}
+
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: severity,
+			Category: types.CategoryRouting,
+			Resource: &types.ResourceRef{
+				Kind:      "Endpoints",
+				Namespace: item.GetNamespace(),
+				Name:      item.GetName(),
+			},
+			Summary: fmt.Sprintf("%s/%s ready=%d not-ready=%d", item.GetNamespace(), item.GetName(), readyCount, notReadyCount),
+			Detail:  fmt.Sprintf("readyAddresses=%d notReadyAddresses=%d", readyCount, notReadyCount),
 		})
 	}
 
-	return NewResponse(t.Cfg, t.Name(), map[string]interface{}{
-		"count":     len(endpoints),
-		"endpoints": endpoints,
-	}), nil
+	return NewToolResultResponse(t.Cfg, t.Name(), findings, ns, ""), nil
 }

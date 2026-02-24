@@ -671,3 +671,463 @@ func kgatewayTargetKey(targetRef map[string]interface{}, defaultNs string) strin
 	}
 	return key
 }
+
+// --- check_kgateway_health ---
+
+type CheckKgatewayHealthTool struct{ BaseTool }
+
+func (t *CheckKgatewayHealthTool) Name() string { return "check_kgateway_health" }
+func (t *CheckKgatewayHealthTool) Description() string {
+	return "Check kgateway installation health: control plane pod status, resource translation status, and data plane proxy health for kgateway-managed Gateways"
+}
+func (t *CheckKgatewayHealthTool) InputSchema() map[string]interface{} {
+	return map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"namespace": map[string]interface{}{
+				"type":        "string",
+				"description": "Namespace where kgateway is installed (default: kgateway-system)",
+			},
+		},
+	}
+}
+
+func (t *CheckKgatewayHealthTool) Run(ctx context.Context, args map[string]interface{}) (*StandardResponse, error) {
+	ns := getStringArg(args, "namespace", "kgateway-system")
+
+	var findings []types.DiagnosticFinding
+
+	// 1. Control plane pod health
+	findings = append(findings, t.checkControlPlanePods(ctx, ns)...)
+
+	// 2. Translation status of kgateway resources
+	findings = append(findings, t.checkResourceTranslationStatus(ctx)...)
+
+	// 3. Data plane proxy health for kgateway-managed Gateways
+	findings = append(findings, t.checkDataPlaneHealth(ctx)...)
+
+	if len(findings) == 0 {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: types.SeverityOK,
+			Category: types.CategoryMesh,
+			Summary:  "kgateway installation health check passed — no issues detected",
+		})
+	}
+
+	return NewToolResultResponse(t.Cfg, t.Name(), findings, ns, "kgateway"), nil
+}
+
+// checkControlPlanePods checks kgateway control plane pods for readiness.
+func (t *CheckKgatewayHealthTool) checkControlPlanePods(ctx context.Context, ns string) []types.DiagnosticFinding {
+	var findings []types.DiagnosticFinding
+
+	// kgateway control plane pods are typically labelled app.kubernetes.io/name=kgateway or app=kgateway
+	for _, labelSelector := range []string{"app.kubernetes.io/name=kgateway", "app=kgateway"} {
+		podList, err := t.Clients.Dynamic.Resource(podsGVR).Namespace(ns).List(ctx, metav1.ListOptions{
+			LabelSelector: labelSelector,
+		})
+		if err != nil {
+			continue
+		}
+		if len(podList.Items) == 0 {
+			continue
+		}
+
+		for _, pod := range podList.Items {
+			findings = append(findings, evaluatePodHealth(&pod, "control-plane")...)
+		}
+		return findings
+	}
+
+	// Also try deployment-based discovery
+	deploymentsGVR := schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"}
+	depList, err := t.Clients.Dynamic.Resource(deploymentsGVR).Namespace(ns).List(ctx, metav1.ListOptions{})
+	if err == nil {
+		for _, dep := range depList.Items {
+			depName := dep.GetName()
+			if strings.Contains(depName, "kgateway") || strings.Contains(depName, "gloo") {
+				// Check the deployment's pods via matchLabels
+				selector, _, _ := unstructured.NestedMap(dep.Object, "spec", "selector", "matchLabels")
+				if len(selector) == 0 {
+					continue
+				}
+				labelParts := make([]string, 0, len(selector))
+				for k, v := range selector {
+					if vs, ok := v.(string); ok {
+						labelParts = append(labelParts, k+"="+vs)
+					}
+				}
+				podList, podErr := t.Clients.Dynamic.Resource(podsGVR).Namespace(ns).List(ctx, metav1.ListOptions{
+					LabelSelector: strings.Join(labelParts, ","),
+				})
+				if podErr != nil || len(podList.Items) == 0 {
+					findings = append(findings, types.DiagnosticFinding{
+						Severity:   types.SeverityCritical,
+						Category:   types.CategoryMesh,
+						Resource:   &types.ResourceRef{Kind: "Deployment", Namespace: ns, Name: depName, APIVersion: "apps/v1"},
+						Summary:    fmt.Sprintf("kgateway Deployment %s/%s has no running pods", ns, depName),
+						Suggestion: "Check deployment status and events for scheduling or image pull issues",
+					})
+					continue
+				}
+				for _, pod := range podList.Items {
+					findings = append(findings, evaluatePodHealth(&pod, "control-plane")...)
+				}
+			}
+		}
+	}
+
+	if len(findings) == 0 {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity:   types.SeverityWarning,
+			Category:   types.CategoryMesh,
+			Summary:    fmt.Sprintf("No kgateway control plane pods found in namespace %s", ns),
+			Suggestion: "Verify kgateway is installed and the correct namespace is specified",
+		})
+	}
+
+	return findings
+}
+
+// evaluatePodHealth returns findings for a single pod's health status.
+func evaluatePodHealth(pod *unstructured.Unstructured, role string) []types.DiagnosticFinding {
+	var findings []types.DiagnosticFinding
+	podName := pod.GetName()
+	podNs := pod.GetNamespace()
+	ref := &types.ResourceRef{Kind: "Pod", Namespace: podNs, Name: podName}
+
+	phase, _, _ := unstructured.NestedString(pod.Object, "status", "phase")
+
+	// Check container statuses
+	containerStatuses, _, _ := unstructured.NestedSlice(pod.Object, "status", "containerStatuses")
+	allReady := true
+	restartCount := 0
+	var notReadyContainers []string
+
+	for _, cs := range containerStatuses {
+		csMap, ok := cs.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		cName, _ := csMap["name"].(string)
+		ready, _, _ := unstructured.NestedBool(csMap, "ready")
+		restarts, _, _ := unstructured.NestedFloat64(csMap, "restartCount")
+		restartCount += int(restarts)
+
+		if !ready {
+			allReady = false
+			notReadyContainers = append(notReadyContainers, cName)
+		}
+
+		// Check for waiting state with error reason
+		if waiting, ok := csMap["state"].(map[string]interface{}); ok {
+			if w, ok := waiting["waiting"].(map[string]interface{}); ok {
+				reason, _ := w["reason"].(string)
+				message, _ := w["message"].(string)
+				if reason == "CrashLoopBackOff" || reason == "ImagePullBackOff" || reason == "ErrImagePull" {
+					findings = append(findings, types.DiagnosticFinding{
+						Severity:   types.SeverityCritical,
+						Category:   types.CategoryMesh,
+						Resource:   ref,
+						Summary:    fmt.Sprintf("Pod %s/%s container %s is %s", podNs, podName, cName, reason),
+						Detail:     message,
+						Suggestion: "Check container logs and events for the root cause",
+					})
+				}
+			}
+		}
+	}
+
+	if phase == "Running" && allReady {
+		severity := types.SeverityOK
+		summary := fmt.Sprintf("Pod %s/%s (%s) is Running and ready", podNs, podName, role)
+		detail := ""
+		if restartCount > 0 {
+			detail = fmt.Sprintf("Total container restarts: %d", restartCount)
+		}
+		if restartCount > 5 {
+			severity = types.SeverityWarning
+			summary = fmt.Sprintf("Pod %s/%s (%s) is Running but has %d restarts", podNs, podName, role, restartCount)
+		}
+		findings = append(findings, types.DiagnosticFinding{
+			Severity: severity,
+			Category: types.CategoryMesh,
+			Resource: ref,
+			Summary:  summary,
+			Detail:   detail,
+		})
+	} else if phase == "Running" && !allReady {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity:   types.SeverityWarning,
+			Category:   types.CategoryMesh,
+			Resource:   ref,
+			Summary:    fmt.Sprintf("Pod %s/%s (%s) is Running but not all containers are ready", podNs, podName, role),
+			Detail:     fmt.Sprintf("Not ready containers: %s", strings.Join(notReadyContainers, ", ")),
+			Suggestion: "Check container readiness probes and logs",
+		})
+	} else {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity:   types.SeverityCritical,
+			Category:   types.CategoryMesh,
+			Resource:   ref,
+			Summary:    fmt.Sprintf("Pod %s/%s (%s) phase=%s", podNs, podName, role, phase),
+			Suggestion: "Check pod events and logs for scheduling or startup issues",
+		})
+	}
+
+	return findings
+}
+
+// checkResourceTranslationStatus checks status conditions on kgateway-managed resources.
+func (t *CheckKgatewayHealthTool) checkResourceTranslationStatus(ctx context.Context) []types.DiagnosticFinding {
+	var findings []types.DiagnosticFinding
+
+	// Check each kgateway resource type
+	for kind, info := range kgatewayKindGVRs {
+		list, err := t.Clients.Dynamic.Resource(info.gvr).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			slog.Debug("kgateway health: skipping resource type", "kind", kind, "error", err)
+			continue
+		}
+
+		accepted := 0
+		rejected := 0
+		errored := 0
+
+		for _, item := range list.Items {
+			conditions, _, _ := unstructured.NestedSlice(item.Object, "status", "conditions")
+			state := classifyResourceStatus(conditions)
+			switch state {
+			case "accepted":
+				accepted++
+			case "rejected":
+				rejected++
+				findings = append(findings, types.DiagnosticFinding{
+					Severity: types.SeverityCritical,
+					Category: types.CategoryMesh,
+					Resource: &types.ResourceRef{
+						Kind:       kind,
+						Namespace:  item.GetNamespace(),
+						Name:       item.GetName(),
+						APIVersion: info.apiGroup,
+					},
+					Summary:    fmt.Sprintf("%s %s/%s is rejected by kgateway", kind, item.GetNamespace(), item.GetName()),
+					Detail:     extractConditionMessage(conditions, "Accepted"),
+					Suggestion: "Check the resource configuration — the kgateway controller could not translate it",
+				})
+			case "errored":
+				errored++
+				findings = append(findings, types.DiagnosticFinding{
+					Severity: types.SeverityWarning,
+					Category: types.CategoryMesh,
+					Resource: &types.ResourceRef{
+						Kind:       kind,
+						Namespace:  item.GetNamespace(),
+						Name:       item.GetName(),
+						APIVersion: info.apiGroup,
+					},
+					Summary: fmt.Sprintf("%s %s/%s has error conditions", kind, item.GetNamespace(), item.GetName()),
+					Detail:  extractConditionMessage(conditions, ""),
+				})
+			}
+		}
+
+		total := len(list.Items)
+		if total > 0 {
+			severity := types.SeverityInfo
+			if rejected > 0 || errored > 0 {
+				severity = types.SeverityWarning
+			}
+			findings = append(findings, types.DiagnosticFinding{
+				Severity: severity,
+				Category: types.CategoryMesh,
+				Summary:  fmt.Sprintf("%s resources: %d total, %d accepted, %d rejected, %d errored", kind, total, accepted, rejected, errored),
+			})
+		}
+	}
+
+	return findings
+}
+
+// classifyResourceStatus determines the translation state from status conditions.
+func classifyResourceStatus(conditions []interface{}) string {
+	for _, c := range conditions {
+		cm, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		condType, _ := cm["type"].(string)
+		condStatus, _ := cm["status"].(string)
+		reason, _ := cm["reason"].(string)
+
+		if condType == "Accepted" {
+			if condStatus == "True" {
+				return "accepted"
+			}
+			return "rejected"
+		}
+		// Check for error-related conditions
+		if condStatus == "False" && (strings.Contains(reason, "Error") || strings.Contains(reason, "Invalid")) {
+			return "errored"
+		}
+	}
+	return "unknown"
+}
+
+// extractConditionMessage returns the message from a specific condition type, or all False conditions.
+func extractConditionMessage(conditions []interface{}, condType string) string {
+	var messages []string
+	for _, c := range conditions {
+		cm, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		ct, _ := cm["type"].(string)
+		status, _ := cm["status"].(string)
+		reason, _ := cm["reason"].(string)
+		message, _ := cm["message"].(string)
+
+		if condType != "" && ct == condType {
+			return fmt.Sprintf("reason=%s: %s", reason, message)
+		}
+		if condType == "" && status == "False" {
+			messages = append(messages, fmt.Sprintf("%s: reason=%s: %s", ct, reason, message))
+		}
+	}
+	return strings.Join(messages, "; ")
+}
+
+// checkDataPlaneHealth checks Gateways managed by kgateway for proxy health.
+func (t *CheckKgatewayHealthTool) checkDataPlaneHealth(ctx context.Context) []types.DiagnosticFinding {
+	var findings []types.DiagnosticFinding
+
+	gatewayAPIGVR := schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "gateways"}
+	gateways, err := t.Clients.Dynamic.Resource(gatewayAPIGVR).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		slog.Debug("kgateway health: skipping Gateway data plane check", "error", err)
+		return findings
+	}
+
+	for _, gw := range gateways.Items {
+		// Check if this Gateway is managed by kgateway
+		if !isKgatewayManaged(&gw) {
+			continue
+		}
+
+		gwNs := gw.GetNamespace()
+		gwName := gw.GetName()
+		gwRef := &types.ResourceRef{
+			Kind:       "Gateway",
+			Namespace:  gwNs,
+			Name:       gwName,
+			APIVersion: "gateway.networking.k8s.io",
+		}
+
+		// Check Gateway status conditions
+		conditions, _, _ := unstructured.NestedSlice(gw.Object, "status", "conditions")
+		hasProgrammed := false
+		for _, c := range conditions {
+			cm, ok := c.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			condType, _ := cm["type"].(string)
+			condStatus, _ := cm["status"].(string)
+			reason, _ := cm["reason"].(string)
+			message, _ := cm["message"].(string)
+
+			if condType == "Programmed" {
+				hasProgrammed = true
+				if condStatus == "True" {
+					findings = append(findings, types.DiagnosticFinding{
+						Severity: types.SeverityOK,
+						Category: types.CategoryMesh,
+						Resource: gwRef,
+						Summary:  fmt.Sprintf("Gateway %s/%s (kgateway) is Programmed", gwNs, gwName),
+					})
+				} else {
+					findings = append(findings, types.DiagnosticFinding{
+						Severity:   types.SeverityCritical,
+						Category:   types.CategoryMesh,
+						Resource:   gwRef,
+						Summary:    fmt.Sprintf("Gateway %s/%s (kgateway) is NOT Programmed: reason=%s", gwNs, gwName, reason),
+						Detail:     message,
+						Suggestion: "Check kgateway controller logs and Gateway resource configuration",
+					})
+				}
+			}
+
+			if condType == "Accepted" && condStatus == "False" {
+				findings = append(findings, types.DiagnosticFinding{
+					Severity:   types.SeverityCritical,
+					Category:   types.CategoryMesh,
+					Resource:   gwRef,
+					Summary:    fmt.Sprintf("Gateway %s/%s (kgateway) is NOT Accepted: reason=%s", gwNs, gwName, reason),
+					Detail:     message,
+					Suggestion: "Review Gateway configuration and check if the GatewayClass is correct",
+				})
+			}
+		}
+
+		if !hasProgrammed {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity:   types.SeverityWarning,
+				Category:   types.CategoryMesh,
+				Resource:   gwRef,
+				Summary:    fmt.Sprintf("Gateway %s/%s (kgateway) has no Programmed condition", gwNs, gwName),
+				Suggestion: "The Gateway may still be provisioning or the kgateway controller may not be processing it",
+			})
+		}
+
+		// Check data plane proxy pods for this Gateway
+		proxyLabels := fmt.Sprintf("gateway.networking.k8s.io/gateway-name=%s", gwName)
+		proxyPods, podErr := t.Clients.Dynamic.Resource(podsGVR).Namespace(gwNs).List(ctx, metav1.ListOptions{
+			LabelSelector: proxyLabels,
+		})
+		if podErr == nil {
+			if len(proxyPods.Items) == 0 {
+				findings = append(findings, types.DiagnosticFinding{
+					Severity:   types.SeverityWarning,
+					Category:   types.CategoryMesh,
+					Resource:   gwRef,
+					Summary:    fmt.Sprintf("Gateway %s/%s (kgateway) has no data plane proxy pods", gwNs, gwName),
+					Suggestion: "Check if kgateway has provisioned the proxy deployment for this Gateway",
+				})
+			} else {
+				for _, pod := range proxyPods.Items {
+					findings = append(findings, evaluatePodHealth(&pod, "data-plane")...)
+				}
+			}
+		}
+	}
+
+	return findings
+}
+
+// isKgatewayManaged checks if a Gateway is managed by kgateway via gatewayClassName or annotations.
+func isKgatewayManaged(gw *unstructured.Unstructured) bool {
+	// Check gatewayClassName
+	className, _, _ := unstructured.NestedString(gw.Object, "spec", "gatewayClassName")
+	if strings.Contains(strings.ToLower(className), "kgateway") || strings.Contains(strings.ToLower(className), "gloo") {
+		return true
+	}
+
+	// Check annotations
+	annotations := gw.GetAnnotations()
+	for k := range annotations {
+		if strings.Contains(k, "kgateway.dev") {
+			return true
+		}
+	}
+
+	// Check infrastructure parametersRef
+	infraParams, _, _ := unstructured.NestedMap(gw.Object, "spec", "infrastructure", "parametersRef")
+	if infraParams != nil {
+		refGroup, _ := infraParams["group"].(string)
+		if refGroup == "kgateway.dev" {
+			return true
+		}
+	}
+
+	return false
+}

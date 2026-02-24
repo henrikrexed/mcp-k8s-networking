@@ -1,0 +1,168 @@
+# Sprint Status - mcp-k8s-networking
+# ==================================
+# generated: 2026-02-24
+# project: mcp-k8s-networking
+# project_key: NOKEY
+# tracking_system: file-system
+# story_location: _bmad-output/implementation-artifacts
+
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+#
+# Epic Status Transitions:
+#   - backlog → in-progress: Automatically when first story is created (via create-story)
+#   - in-progress → done: Manually when all stories reach 'done' status
+#
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created in stories folder
+#   - in-progress: Developer actively working on implementation
+#   - review: Implementation complete, ready for review
+#   - done: Story completed
+#
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+#
+# WORKFLOW NOTES:
+# ===============
+# - Epic transitions to 'in-progress' automatically when first story is created
+# - Stories can be worked in parallel if team capacity allows
+# - SM typically creates next story after previous one is 'done' to incorporate learnings
+# - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+
+generated: 2026-02-24
+project: mcp-k8s-networking
+project_key: NOKEY
+tracking_system: file-system
+story_location: "_bmad-output/implementation-artifacts"
+
+development_status:
+  # ============================================================
+  # Epic 1: MCP Server Foundation & Core K8s Diagnostics
+  # ============================================================
+  epic-1: done
+  1-1-migrate-mcp-server-to-official-go-sdk: done
+  1-2-implement-crd-watch-based-discovery: done
+  1-3-implement-structured-logging-and-configuration: done
+  1-4-implement-standard-diagnostic-response-types: done
+  1-5-service-and-endpoint-diagnostics: done
+  1-6-networkpolicy-analysis: done
+  1-7-dns-resolution-and-kube-proxy-health-diagnostics: done
+  1-8-ingress-resource-inspection: done
+  1-9-health-probes-and-graceful-shutdown: done
+  epic-1-retrospective: optional
+
+  # ============================================================
+  # Epic 2: Networking Log Collection & Error Analysis
+  # ============================================================
+  epic-2: done
+  2-1-proxy-sidecar-log-collection: done
+  2-2-gateway-controller-and-infrastructure-log-collection: done
+  2-3-log-error-analysis-and-categorization: done
+  epic-2-retrospective: optional
+
+  # ============================================================
+  # Epic 3: Gateway API Diagnostics
+  # ============================================================
+  epic-3: done
+  3-1-fix-and-enhance-gateway-and-httproute-diagnostics: done
+  3-2-grpcroute-validation: done
+  3-3-referencegrant-inspection: done
+  3-4-gateway-api-misconfiguration-scan: done
+  3-5-gateway-api-conformance-validation: done
+  epic-3-retrospective: optional
+
+  # ============================================================
+  # Epic 4: Istio Diagnostics
+  # ============================================================
+  epic-4: done
+  4-1-fix-and-enhance-istio-resource-listing-and-retrieval: done
+  4-2-enhanced-sidecar-injection-and-mtls-checks: done
+  4-3-istio-configuration-validation: done
+  4-4-istio-authorizationpolicy-analysis: done
+  4-5-istio-traffic-routing-analysis: done
+  epic-4-retrospective: optional
+
+  # ============================================================
+  # Epic 5: kgateway Diagnostics
+  # ============================================================
+  epic-5: done
+  5-1-kgateway-resource-validation: done
+  5-2-kgateway-installation-health-summary: done
+  epic-5-retrospective: optional
+
+  # ============================================================
+  # Epic 6: Active Diagnostic Probing
+  # ============================================================
+  epic-6: backlog
+  6-1-ephemeral-pod-manager: backlog
+  6-2-network-connectivity-and-dns-probes: backlog
+  6-3-http-service-probes: backlog
+  epic-6-retrospective: optional
+
+  # ============================================================
+  # Epic 7: CRD-Aware Design Guidance & Remediation
+  # ============================================================
+  epic-7: backlog
+  7-1-gateway-api-design-guidance: backlog
+  7-2-istio-design-guidance: backlog
+  7-3-kgateway-design-guidance: backlog
+  7-4-diagnostic-remediation-suggestions: backlog
+  epic-7-retrospective: optional
+
+  # ============================================================
+  # Epic 8: Tier 2 Provider Support
+  # ============================================================
+  epic-8: backlog
+  8-1-kuma-basic-diagnostics: backlog
+  8-2-linkerd-basic-diagnostics: backlog
+  8-3-cilium-networkpolicy-and-connectivity-diagnostics: backlog
+  8-4-calico-networkpolicy-diagnostics: backlog
+  8-5-flannel-detection-and-health: backlog
+  epic-8-retrospective: optional
+
+  # ============================================================
+  # Epic 9: Production Deployment — Helm Chart & Gateway API
+  # ============================================================
+  epic-9: backlog
+  9-1-helm-chart-foundation: backlog
+  9-2-gateway-api-httproute-exposure: backlog
+  9-3-update-raw-yaml-manifests: backlog
+  epic-9-retrospective: optional
+
+  # ============================================================
+  # Epic 10: Documentation Website
+  # ============================================================
+  epic-10: backlog
+  10-1-mkdocs-site-setup-and-structure: backlog
+  10-2-tool-reference-documentation: backlog
+  10-3-setup-and-deployment-guide: backlog
+  10-4-architecture-and-contributing-guide: backlog
+  epic-10-retrospective: optional
+
+  # ============================================================
+  # Epic 11: Agent Skills for Networking Configuration
+  # ============================================================
+  epic-11: backlog
+  11-1-skills-framework-and-registry: backlog
+  11-2-expose-service-via-gateway-api-skill: backlog
+  11-3-configure-istio-mtls-skill: backlog
+  11-4-configure-traffic-splitting-skill: backlog
+  11-5-create-networkpolicy-skill: backlog
+  epic-11-retrospective: optional
+
+  # ============================================================
+  # Epic 12: OpenTelemetry Instrumentation
+  # ============================================================
+  epic-12: in-progress
+  12-1-otel-sdk-setup-and-trace-provider: done
+  12-2-mcp-tool-invocation-spans: backlog
+  12-3-k8s-api-call-spans: backlog
+  12-4-probe-lifecycle-spans: backlog
+  12-5-structured-log-correlation-with-traces: backlog
+  epic-12-retrospective: optional

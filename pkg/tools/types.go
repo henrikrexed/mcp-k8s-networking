@@ -6,6 +6,7 @@ import (
 
 	"github.com/isitobservable/k8s-networking-mcp/pkg/config"
 	"github.com/isitobservable/k8s-networking-mcp/pkg/k8s"
+	"github.com/isitobservable/k8s-networking-mcp/pkg/types"
 )
 
 type Tool interface {
@@ -55,4 +56,31 @@ func getIntArg(args map[string]interface{}, key string, defaultVal int) int {
 		}
 	}
 	return defaultVal
+}
+
+func getBoolArg(args map[string]interface{}, key string, defaultVal bool) bool {
+	if v, ok := args[key]; ok {
+		if b, ok := v.(bool); ok {
+			return b
+		}
+	}
+	return defaultVal
+}
+
+// NewToolResultResponse creates a StandardResponse wrapping a ToolResult with auto-populated metadata.
+func NewToolResultResponse(cfg *config.Config, toolName string, findings []types.DiagnosticFinding, namespace, provider string) *StandardResponse {
+	return &StandardResponse{
+		Cluster:   cfg.ClusterName,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Tool:      toolName,
+		Data: &types.ToolResult{
+			Findings: findings,
+			Metadata: types.ClusterMetadata{
+				ClusterName: cfg.ClusterName,
+				Timestamp:   time.Now().UTC(),
+				Namespace:   namespace,
+				Provider:    provider,
+			},
+		},
+	}
 }
