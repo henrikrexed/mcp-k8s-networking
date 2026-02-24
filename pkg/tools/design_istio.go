@@ -283,7 +283,9 @@ func parseTrafficSplit(split string) []trafficEntry {
 		parts := strings.SplitN(strings.TrimSpace(part), ":", 2)
 		if len(parts) == 2 {
 			weight := 0
-			fmt.Sscanf(parts[1], "%d", &weight)
+			if n, _ := fmt.Sscanf(parts[1], "%d", &weight); n == 0 {
+				continue
+			}
 			entries = append(entries, trafficEntry{subset: parts[0], weight: weight})
 		}
 	}

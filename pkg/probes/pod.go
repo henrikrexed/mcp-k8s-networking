@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -17,9 +18,12 @@ import (
 	"github.com/isitobservable/k8s-networking-mcp/pkg/k8s"
 )
 
+// podCounter provides unique pod names across concurrent probes.
+var podCounter atomic.Int64
+
 // createProbePod creates an ephemeral pod in the given namespace with the probe command.
 func createProbePod(ctx context.Context, clients *k8s.Clients, cfg *config.Config, namespace string, req ProbeRequest) (string, error) {
-	podName := fmt.Sprintf("mcp-probe-%s-%d", req.Type, time.Now().UnixNano()%100000)
+	podName := fmt.Sprintf("mcp-probe-%s-%d-%d", req.Type, time.Now().Unix(), podCounter.Add(1))
 
 	falseVal := false
 	trueVal := true

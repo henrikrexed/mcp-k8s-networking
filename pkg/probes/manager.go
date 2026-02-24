@@ -118,7 +118,9 @@ func (m *Manager) acquireSlot() error {
 func (m *Manager) releaseSlot() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.running--
+	if m.running > 0 {
+		m.running--
+	}
 	slog.Debug("probe: released slot", "running", m.running)
 }
 

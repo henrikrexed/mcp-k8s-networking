@@ -3,11 +3,31 @@ package tools
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/isitobservable/k8s-networking-mcp/pkg/probes"
 	"github.com/isitobservable/k8s-networking-mcp/pkg/types"
 )
+
+// validHostname matches DNS names, IPs, and K8s service FQDNs.
+var validHostname = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+
+// probeAllowedMethods whitelist for HTTP probe methods.
+var probeAllowedMethods = map[string]bool{
+	"GET": true, "POST": true, "HEAD": true, "PUT": true, "DELETE": true, "PATCH": true, "OPTIONS": true,
+}
+
+// validRecordType whitelist.
+var validRecordTypes = map[string]bool{
+	"A": true, "AAAA": true, "SRV": true, "CNAME": true, "MX": true, "TXT": true, "NS": true, "PTR": true,
+}
+
+// containsShellMeta returns true if the string contains shell metacharacters.
+func containsShellMeta(s string) bool {
+	return strings.ContainsAny(s, "'\"`;|&$(){}[]<>!\\#~")
+}
 
 // --- probe_connectivity ---
 
@@ -56,6 +76,13 @@ func (t *ProbeConnectivityTool) Run(ctx context.Context, args map[string]interfa
 			Code:    types.ErrCodeInvalidInput,
 			Tool:    t.Name(),
 			Message: "target_host is required",
+		}
+	}
+	if !validHostname.MatchString(targetHost) {
+		return nil, &types.MCPError{
+			Code:    types.ErrCodeInvalidInput,
+			Tool:    t.Name(),
+			Message: "target_host contains invalid characters",
 		}
 	}
 	if timeoutSec > 30 {
@@ -145,6 +172,16 @@ func (t *ProbeDNSTool) Run(ctx context.Context, args map[string]interface{}) (*S
 			Tool:    t.Name(),
 			Message: "hostname is required",
 		}
+	}
+	if !validHostname.MatchString(hostname) {
+		return nil, &types.MCPError{
+			Code:    types.ErrCodeInvalidInput,
+			Tool:    t.Name(),
+			Message: "hostname contains invalid characters",
+		}
+	}
+	if !validRecordTypes[strings.ToUpper(recordType)] {
+		recordType = "A"
 	}
 
 	req := probes.ProbeRequest{
@@ -238,6 +275,17 @@ func (t *ProbeHTTPTool) Run(ctx context.Context, args map[string]interface{}) (*
 			Message: "url is required",
 		}
 	}
+	if containsShellMeta(url) {
+		return nil, &types.MCPError{
+			Code:    types.ErrCodeInvalidInput,
+			Tool:    t.Name(),
+			Message: "url contains invalid shell characters",
+		}
+	}
+	method = strings.ToUpper(method)
+	if !probeAllowedMethods[method] {
+		method = "GET"
+	}
 	if timeoutSec > 30 {
 		timeoutSec = 30
 	}
@@ -248,13 +296,13 @@ func (t *ProbeHTTPTool) Run(ctx context.Context, args map[string]interface{}) (*
 	if headers != "" {
 		for _, h := range strings.Split(headers, ";") {
 			h = strings.TrimSpace(h)
-			if h != "" {
+			if h != "" && !containsShellMeta(h) {
 				curlCmd += fmt.Sprintf(" -H '%s'", h)
 			}
 		}
 	}
 
-	curlCmd += fmt.Sprintf(" '%s'", url)
+	curlCmd += fmt.Sprintf(" %s", url)
 	curlCmd += " 2>&1; echo; echo '---BODY---'; head -c 1024 /tmp/body 2>/dev/null || true"
 
 	req := probes.ProbeRequest{
@@ -292,11 +340,12 @@ func (t *ProbeHTTPTool) Run(ctx context.Context, args map[string]interface{}) (*
 
 	if result.Success && statusCode != "000" {
 		severity := types.SeverityOK
-		if statusCode >= "400" {
-			severity = types.SeverityWarning
-		}
-		if statusCode >= "500" {
-			severity = types.SeverityCritical
+		if code, err := strconv.Atoi(statusCode); err == nil {
+			if code >= 500 {
+				severity = types.SeverityCritical
+			} else if code >= 400 {
+				severity = types.SeverityWarning
+			}
 		}
 
 		findings = append(findings, types.DiagnosticFinding{

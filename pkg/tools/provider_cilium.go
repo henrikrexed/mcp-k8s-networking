@@ -42,13 +42,9 @@ func (t *ListCiliumPoliciesTool) Run(ctx context.Context, args map[string]interf
 	findings := make([]types.DiagnosticFinding, 0, 10)
 
 	// CiliumNetworkPolicies
-	var cnpList interface{}
-	var err error
 	if ns == "" {
-		list, e := t.Clients.Dynamic.Resource(ciliumNPGVR).List(ctx, metav1.ListOptions{})
-		err = e
-		cnpList = list
-		if e == nil {
+		list, err := t.Clients.Dynamic.Resource(ciliumNPGVR).List(ctx, metav1.ListOptions{})
+		if err == nil {
 			for _, item := range list.Items {
 				findings = append(findings, types.DiagnosticFinding{
 					Severity: types.SeverityInfo,
@@ -59,10 +55,8 @@ func (t *ListCiliumPoliciesTool) Run(ctx context.Context, args map[string]interf
 			}
 		}
 	} else {
-		list, e := t.Clients.Dynamic.Resource(ciliumNPGVR).Namespace(ns).List(ctx, metav1.ListOptions{})
-		err = e
-		cnpList = list
-		if e == nil {
+		list, err := t.Clients.Dynamic.Resource(ciliumNPGVR).Namespace(ns).List(ctx, metav1.ListOptions{})
+		if err == nil {
 			for _, item := range list.Items {
 				findings = append(findings, types.DiagnosticFinding{
 					Severity: types.SeverityInfo,
@@ -73,8 +67,6 @@ func (t *ListCiliumPoliciesTool) Run(ctx context.Context, args map[string]interf
 			}
 		}
 	}
-	_ = cnpList
-	_ = err
 
 	// CiliumClusterwideNetworkPolicies
 	ccnpList, ccnpErr := t.Clients.Dynamic.Resource(ciliumCNPGVR).List(ctx, metav1.ListOptions{})
@@ -168,29 +160,25 @@ func (t *CheckCiliumStatusTool) Run(ctx context.Context, args map[string]interfa
 	}
 
 	// Count Cilium endpoints
-	var endpoints interface{}
 	if ns == "" {
-		epList, e := t.Clients.Dynamic.Resource(ciliumEPGVR).List(ctx, metav1.ListOptions{})
-		if e == nil {
+		epList, err := t.Clients.Dynamic.Resource(ciliumEPGVR).List(ctx, metav1.ListOptions{})
+		if err == nil {
 			findings = append(findings, types.DiagnosticFinding{
 				Severity: types.SeverityInfo,
 				Category: types.CategoryMesh,
 				Summary:  fmt.Sprintf("Cilium endpoints: %d cluster-wide", len(epList.Items)),
 			})
 		}
-		endpoints = epList
 	} else {
-		epList, e := t.Clients.Dynamic.Resource(ciliumEPGVR).Namespace(ns).List(ctx, metav1.ListOptions{})
-		if e == nil {
+		epList, err := t.Clients.Dynamic.Resource(ciliumEPGVR).Namespace(ns).List(ctx, metav1.ListOptions{})
+		if err == nil {
 			findings = append(findings, types.DiagnosticFinding{
 				Severity: types.SeverityInfo,
 				Category: types.CategoryMesh,
 				Summary:  fmt.Sprintf("Cilium endpoints in %s: %d", ns, len(epList.Items)),
 			})
 		}
-		endpoints = epList
 	}
-	_ = endpoints
 
 	return NewToolResultResponse(t.Cfg, t.Name(), findings, ns, "cilium"), nil
 }

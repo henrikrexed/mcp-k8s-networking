@@ -40,7 +40,7 @@ func (m *Manager) cleanupOrphans(ctx context.Context) {
 		LabelSelector: LabelManagedBy + "=" + LabelManagedByValue,
 	})
 	if err != nil {
-		slog.Debug("probe: cleanup failed to list pods", "namespace", ns, "error", err)
+		slog.Warn("probe: cleanup failed to list pods", "namespace", ns, "error", err)
 		return
 	}
 
@@ -54,6 +54,7 @@ func (m *Manager) cleanupOrphans(ctx context.Context) {
 		}
 		createdAt, err := time.Parse(time.RFC3339, createdAtStr)
 		if err != nil {
+			slog.Warn("probe: cleanup skipped pod with invalid timestamp", "pod", pod.Name, "annotation", createdAtStr, "error", err)
 			continue
 		}
 		if now.Sub(createdAt) > probeTTL {

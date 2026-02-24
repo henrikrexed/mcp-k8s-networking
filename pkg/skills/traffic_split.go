@@ -46,6 +46,24 @@ func (s *TrafficSplitSkill) Execute(ctx context.Context, args map[string]interfa
 	}
 	steps := make([]StepResult, 0, 7)
 
+	// Step 0: Validate version/weight count match
+	if len(versions) != len(weights) {
+		steps = append(steps, StepResult{
+			StepName: "validate_inputs",
+			Status:   "failed",
+			Findings: []types.DiagnosticFinding{{
+				Severity:   types.SeverityCritical,
+				Category:   types.CategoryRouting,
+				Summary:    fmt.Sprintf("Version count (%d) does not match weight count (%d)", len(versions), len(weights)),
+				Suggestion: "Provide the same number of versions and weights.",
+			}},
+		})
+		result.Steps = steps
+		result.Status = "failed"
+		result.Summary = fmt.Sprintf("Version count (%d) does not match weight count (%d)", len(versions), len(weights))
+		return result, nil
+	}
+
 	// Step 1: Verify service exists
 	_, err := s.base.clients.Dynamic.Resource(svcGVR).Namespace(ns).Get(ctx, svcName, metav1.GetOptions{})
 	if err != nil {
@@ -221,8 +239,9 @@ func parseWeights(s string) []int {
 	weights := make([]int, 0, len(parts))
 	for _, p := range parts {
 		w := 0
-		fmt.Sscanf(strings.TrimSpace(p), "%d", &w)
-		weights = append(weights, w)
+		if n, _ := fmt.Sscanf(strings.TrimSpace(p), "%d", &w); n > 0 {
+			weights = append(weights, w)
+		}
 	}
 	return weights
 }

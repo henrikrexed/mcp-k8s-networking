@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/isitobservable/k8s-networking-mcp/pkg/skills"
+	"github.com/isitobservable/k8s-networking-mcp/pkg/types"
 )
 
 // ListSkillsTool exposes the skills registry as an MCP tool.
@@ -81,7 +82,11 @@ func (t *RunSkillTool) InputSchema() map[string]interface{} {
 func (t *RunSkillTool) Run(ctx context.Context, args map[string]interface{}) (*StandardResponse, error) {
 	skillName := getStringArg(args, "skill_name", "")
 	if skillName == "" {
-		return nil, fmt.Errorf("skill_name is required")
+		return nil, &types.MCPError{
+			Code:    types.ErrCodeInvalidInput,
+			Tool:    t.Name(),
+			Message: "skill_name is required",
+		}
 	}
 
 	skill, ok := t.Registry.Get(skillName)
@@ -106,7 +111,11 @@ func (t *RunSkillTool) Run(ctx context.Context, args map[string]interface{}) (*S
 		case string:
 			// Try to parse JSON string
 			if err := json.Unmarshal([]byte(v), &skillArgs); err != nil {
-				return nil, fmt.Errorf("invalid arguments: %w", err)
+				return nil, &types.MCPError{
+					Code:    types.ErrCodeInvalidInput,
+					Tool:    t.Name(),
+					Message: fmt.Sprintf("invalid arguments JSON: %v", err),
+				}
 			}
 		}
 	}

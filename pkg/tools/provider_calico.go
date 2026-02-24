@@ -171,10 +171,15 @@ func (t *CheckCalicoStatusTool) Run(ctx context.Context, args map[string]interfa
 	if err == nil {
 		ready := 0
 		for _, pod := range controllers.Items {
+			allReady := true
 			for _, cs := range pod.Status.ContainerStatuses {
-				if cs.Ready {
-					ready++
+				if !cs.Ready {
+					allReady = false
+					break
 				}
+			}
+			if allReady && len(pod.Status.ContainerStatuses) > 0 {
+				ready++
 			}
 		}
 		findings = append(findings, types.DiagnosticFinding{

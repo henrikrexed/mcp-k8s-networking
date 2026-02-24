@@ -106,11 +106,13 @@ func (s *ConfigureMTLSSkill) Execute(ctx context.Context, args map[string]interf
 	}
 
 	// Step 3: Check for conflicting DestinationRules
+	drConflictFound := false
 	drList, err := s.base.clients.Dynamic.Resource(drGVR).Namespace(ns).List(ctx, metav1.ListOptions{})
 	if err == nil {
 		for _, dr := range drList.Items {
 			tlsMode, _, _ := unstructured.NestedString(dr.Object, "spec", "trafficPolicy", "tls", "mode")
 			if tlsMode != "" && tlsMode != "ISTIO_MUTUAL" && mode == "STRICT" {
+				drConflictFound = true
 				steps = append(steps, StepResult{
 					StepName: "check_dr_conflicts",
 					Status:   "warning",
@@ -125,7 +127,7 @@ func (s *ConfigureMTLSSkill) Execute(ctx context.Context, args map[string]interf
 			}
 		}
 	}
-	if len(steps) < 3 || steps[len(steps)-1].StepName != "check_dr_conflicts" {
+	if !drConflictFound {
 		steps = append(steps, StepResult{
 			StepName: "check_dr_conflicts",
 			Status:   "passed",

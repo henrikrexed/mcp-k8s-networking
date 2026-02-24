@@ -3,6 +3,7 @@ package skills
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -66,8 +67,13 @@ func (s *NetworkPolicySkill) Execute(ctx context.Context, args map[string]interf
 
 	selector, _, _ := unstructured.NestedStringMap(svc.Object, "spec", "selector")
 	selectorYAML := ""
-	for k, v := range selector {
-		selectorYAML += fmt.Sprintf("\n      %s: %s", k, v)
+	selectorKeys := make([]string, 0, len(selector))
+	for k := range selector {
+		selectorKeys = append(selectorKeys, k)
+	}
+	sort.Strings(selectorKeys)
+	for _, k := range selectorKeys {
+		selectorYAML += fmt.Sprintf("\n      %s: %s", k, selector[k])
 	}
 	if selectorYAML == "" {
 		selectorYAML = "\n      app: " + svcName

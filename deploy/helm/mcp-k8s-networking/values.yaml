@@ -49,6 +49,8 @@ securityContext:
   runAsNonRoot: true
   readOnlyRootFilesystem: true
   allowPrivilegeEscalation: false
+  seccompProfile:
+    type: RuntimeDefault
 
 nodeSelector: {}
 tolerations: []

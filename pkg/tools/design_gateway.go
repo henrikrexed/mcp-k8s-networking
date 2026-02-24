@@ -161,12 +161,9 @@ spec:
 
 	// HTTPRoute or GRPCRoute
 	routeKind := "HTTPRoute"
-	routeResource := "httproutes"
 	if protocol == "GRPC" {
 		routeKind = "GRPCRoute"
-		routeResource = "grpcroutes"
 	}
-	_ = routeResource
 
 	parentRefYAML := fmt.Sprintf(`  parentRefs:
   - name: %s`, gwName)
