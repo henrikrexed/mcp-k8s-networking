@@ -1,0 +1,58 @@
+site_name: mcp-k8s-networking
+site_description: MCP server for Kubernetes networking diagnostics
+site_url: https://isitobservable.github.io/k8s-networking-mcp/
+repo_url: https://github.com/isitobservable/k8s-networking-mcp
+repo_name: isitobservable/k8s-networking-mcp
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: blue
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: blue
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - content.code.copy
+    - search.highlight
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Quick Start: getting-started.md
+    - Configuration: configuration.md
+  - Tools Reference:
+    - Overview: tools/index.md
+    - Core Kubernetes: tools/core-k8s.md
+    - Gateway API: tools/gateway-api.md
+    - Istio: tools/istio.md
+    - kgateway: tools/kgateway.md
+    - Tier 2 Providers: tools/tier2-providers.md
+    - Log Collection: tools/logs.md
+    - Active Probing: tools/probing.md
+    - Design Guidance: tools/design-guidance.md
+    - Agent Skills: tools/skills.md
+  - Architecture: architecture.md
+  - Contributing: contributing.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - toc:
+      permalink: true

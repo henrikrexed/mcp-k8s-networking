@@ -138,11 +138,11 @@ development_status:
   # ============================================================
   # Epic 10: Documentation Website
   # ============================================================
-  epic-10: backlog
-  10-1-mkdocs-site-setup-and-structure: backlog
-  10-2-tool-reference-documentation: backlog
-  10-3-setup-and-deployment-guide: backlog
-  10-4-architecture-and-contributing-guide: backlog
+  epic-10: done
+  10-1-mkdocs-site-setup-and-structure: done
+  10-2-tool-reference-documentation: done
+  10-3-setup-and-deployment-guide: done
+  10-4-architecture-and-contributing-guide: done
   epic-10-retrospective: optional
 
   # ============================================================
