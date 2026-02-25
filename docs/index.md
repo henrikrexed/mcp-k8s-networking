@@ -42,3 +42,13 @@ kubectl apply -f deploy/manifests/install.yaml
 ```
 
 See the [Getting Started](getting-started.md) guide for full details.
+
+## Observability
+
+mcp-k8s-networking has built-in OpenTelemetry instrumentation that exports traces, metrics, and logs via OTLP gRPC. Enable it by setting the `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable or the `otel.enabled` Helm value.
+
+- **Traces** - Every tool call produces a span with GenAI + MCP semantic convention attributes
+- **Metrics** - Request duration histograms, request counts, finding counts, error counts
+- **Logs** - Structured JSON logs with automatic trace_id/span_id correlation
+
+See the [Observability](observability.md) guide for full details including backend integration examples.

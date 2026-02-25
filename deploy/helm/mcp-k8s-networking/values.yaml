@@ -67,4 +67,6 @@ gatewayAPI:
 # OpenTelemetry configuration
 otel:
   enabled: false
-  endpoint: ""  # OTLP gRPC endpoint
+  endpoint: "otel-collector.observability.svc.cluster.local:4317"  # OTLP gRPC endpoint
+  insecure: true  # Use insecure gRPC connection (no TLS)
+  serviceName: ""  # Defaults to chart fullname if empty

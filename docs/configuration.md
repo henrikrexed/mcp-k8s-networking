@@ -13,7 +13,9 @@ All configuration is via environment variables.
 | `PROBE_NAMESPACE` | string | `mcp-diagnostics` | Namespace for ephemeral probe pods |
 | `PROBE_IMAGE` | string | `ghcr.io/mcp-k8s-networking/probe:latest` | Container image for probe pods |
 | `MAX_CONCURRENT_PROBES` | int | `5` | Max concurrent probe pods (1-20) |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | string | *(empty)* | OTLP gRPC endpoint for tracing (empty = disabled) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | string | *(empty)* | OTLP gRPC endpoint for telemetry (empty = disabled) |
+| `OTEL_EXPORTER_OTLP_INSECURE` | bool | `true` | Use insecure gRPC (no TLS) for OTLP export |
+| `OTEL_SERVICE_NAME` | string | `mcp-k8s-networking` | Service name in OTel resource attributes |
 
 ## Helm Values
 
@@ -34,8 +36,12 @@ probe:
 
 otel:
   enabled: false
-  endpoint: ""
+  endpoint: "otel-collector.observability.svc.cluster.local:4317"
+  insecure: true
+  serviceName: ""  # defaults to chart fullname
 ```
+
+See [Observability](observability.md) for full details on OTel integration.
 
 ## RBAC Permissions
 

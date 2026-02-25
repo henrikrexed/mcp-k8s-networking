@@ -31,6 +31,7 @@ nav:
   - Getting Started:
     - Quick Start: getting-started.md
     - Configuration: configuration.md
+    - Observability: observability.md
   - Tools Reference:
     - Overview: tools/index.md
     - Core Kubernetes: tools/core-k8s.md

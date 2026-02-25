@@ -53,6 +53,10 @@ spec:
             {{- if .Values.otel.enabled }}
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: {{ .Values.otel.endpoint | quote }}
+            - name: OTEL_EXPORTER_OTLP_INSECURE
+              value: {{ .Values.otel.insecure | quote }}
+            - name: OTEL_SERVICE_NAME
+              value: {{ .Values.otel.serviceName | default (include "mcp-k8s-networking.fullname" .) | quote }}
             {{- end }}
           livenessProbe:
             httpGet:
