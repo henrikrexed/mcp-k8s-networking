@@ -207,10 +207,10 @@ Agents can follow codified multi-step playbooks (skills) to guide users through 
 **FRs covered:** New scope (extends FR35-37 design guidance into interactive agent workflows)
 **Status:** Not started
 
-### Epic 12: OpenTelemetry Instrumentation
-The MCP server produces distributed traces (spans) for all tool invocations, K8s API calls, CRD discovery, and probe lifecycles. Platform engineers can observe MCP server behavior through their existing OTel-compatible tracing backends (Jaeger, Tempo, Dynatrace, etc.).
-**FRs covered:** New scope (architecture specifies otelslog bridge; this epic adds full tracing with spans)
-**Status:** Not started
+### Epic 12: OpenTelemetry Instrumentation (GenAI + MCP Semantic Conventions)
+The MCP server produces all three OTel signals (traces, metrics, logs) following GenAI and MCP semantic conventions. Every tool invocation produces spans with standardized attributes (gen_ai.tool.name, mcp.method.name, etc.), GenAI metrics track request performance, custom metrics track findings and errors, and structured logs are correlated with traces via the OTel log bridge.
+**FRs covered:** FR-OTel-1 through FR-OTel-8
+**Status:** In progress
 
 ---
 
@@ -1507,71 +1507,159 @@ So that I can guide users through securing namespace-to-namespace communication.
 
 ---
 
-## Epic 12: OpenTelemetry Instrumentation
+## Epic 12: OpenTelemetry Instrumentation (GenAI + MCP Semantic Conventions)
 
-The MCP server produces distributed traces (spans) for all tool invocations, K8s API calls, CRD discovery, and probe lifecycles. Platform engineers can observe MCP server behavior through their existing OTel-compatible tracing backends.
+The MCP server produces all three OTel signals (traces, metrics, logs) following GenAI and MCP semantic conventions. Every tool invocation produces spans with standardized attributes, GenAI metrics track request performance, custom domain metrics track diagnostic findings and errors, and structured logs are correlated with traces via the OTel log bridge. Platform engineers can observe MCP server behavior through any OTel-compatible backend.
 
-### Story 12.1: OTel SDK Setup and Trace Provider
+**Requirements:** FR-OTel-1 through FR-OTel-8
+
+### Story 12.1: Full Telemetry Package (TracerProvider + MeterProvider + LoggerProvider) — UPDATED
 
 As a platform engineer,
-I want the MCP server to initialize an OpenTelemetry trace provider,
-So that spans are exported to my tracing backend (Jaeger, Tempo, Dynatrace, OTLP collector).
+I want the MCP server to initialize all three OTel signal providers (traces, metrics, logs),
+So that I get complete observability via a single OTLP gRPC endpoint.
 
 **Acceptance Criteria:**
 
 **Given** the environment variable `OTEL_EXPORTER_OTLP_ENDPOINT` is set
 **When** the MCP server starts
-**Then** it initializes an OTel TracerProvider with OTLP gRPC exporter targeting the configured endpoint
+**Then** it initializes:
+- TracerProvider with OTLP gRPC trace exporter
+- MeterProvider with OTLP gRPC metric exporter (periodic reader, 30s interval)
+- LoggerProvider with OTLP gRPC log exporter (batch processor)
+- All three share a resource with `service.name="mcp-k8s-networking"`, `service.version`, and `k8s.cluster.name`
 
 **Given** the environment variable `OTEL_EXPORTER_OTLP_ENDPOINT` is NOT set
 **When** the MCP server starts
-**Then** tracing is disabled (noop tracer) and the server operates normally without errors
-
-**Given** the environment variable `OTEL_SERVICE_NAME` is set
-**When** traces are exported
-**Then** spans carry the configured service name (default: "mcp-k8s-networking")
+**Then** all signals are disabled (noop providers) and the server operates normally without errors
 
 **Given** the server shuts down
 **When** graceful shutdown executes
-**Then** the TracerProvider flushes pending spans before exiting
+**Then** all three providers flush pending data before exiting
 
 **Implementation Notes:**
-- Add dependencies: go.opentelemetry.io/otel, go.opentelemetry.io/otel/sdk, go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc
-- New file: pkg/telemetry/tracer.go
-- Use OTel environment variable conventions (OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME, OTEL_RESOURCE_ATTRIBUTES)
-- Set resource attributes: service.name, service.version, k8s.cluster.name (from CLUSTER_NAME config)
+- Update pkg/telemetry/telemetry.go to initialize TracerProvider, MeterProvider, and LoggerProvider
+- Add dependencies: go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc, go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc, go.opentelemetry.io/otel/sdk/metric, go.opentelemetry.io/otel/sdk/log
+- Return a single Shutdown function that flushes all three providers
+- Satisfies: FR-OTel-8
 
-### Story 12.2: MCP Tool Invocation Spans
+**Status:** done (updated from traces-only to full 3-signal setup)
+
+### Story 12.2: MCP Tool Call Instrumentation Middleware with GenAI/MCP Semconv Attributes — UPDATED
 
 As a platform engineer,
-I want every MCP tool invocation to produce a span,
-So that I can observe tool execution times, error rates, and trace diagnostic workflows end-to-end.
+I want every MCP tool call to produce a span following GenAI and MCP semantic conventions,
+So that I can observe tool execution with standardized attributes in any OTel-compatible backend.
 
 **Acceptance Criteria:**
 
-**Given** an agent calls any MCP tool (e.g., `list_services`, `check_dns_resolution`)
+**Given** an agent calls any MCP tool
 **When** the tool executes
 **Then** a span is created with:
-- Name: `mcp.tool/{tool_name}` (e.g., `mcp.tool/list_services`)
-- Attributes: `mcp.tool.name`, `k8s.namespace`, `mcp.session.id`
-- Status: OK on success, ERROR on failure with error message
-- Duration: full tool execution time
+- Name: `execute_tool {tool_name}`
+- Attributes: `gen_ai.operation.name="execute_tool"`, `gen_ai.tool.name`, `mcp.method.name="tools/call"`, `mcp.protocol.version`, `mcp.session.id`, `jsonrpc.request.id`
+- `gen_ai.tool.call.arguments` (sanitized JSON — no secrets/tokens)
+- `gen_ai.tool.call.result` (truncated to 1024 chars)
+- Status: OK on success, ERROR on failure
 
 **Given** a tool invocation fails
 **When** the span is recorded
-**Then** the span status is set to ERROR and the error message is recorded as a span event
+**Then** the span status is ERROR, `error.type` is set to the MCPError code (e.g., `PROVIDER_NOT_FOUND`) or `"tool_error"`, and the error is recorded as a span event
 
-**Given** a multi-step diagnostic workflow (agent calls 4 tools in sequence)
-**When** spans are recorded
-**Then** all tool spans share the same trace ID (propagated via context)
+**Given** a tool invocation completes (success or error)
+**When** metrics are recorded
+**Then** `gen_ai.server.request.duration` histogram and `gen_ai.server.request.count` counter are updated with dimensions `gen_ai.tool.name` and `error.type`
 
 **Implementation Notes:**
-- Instrument the dispatcher/tool execution layer with tracer.Start(ctx, spanName)
-- Pass trace context through to all tool calls
-- Add span attributes from tool input parameters (namespace, resource name)
-- Do NOT include sensitive data in span attributes (no secrets, tokens)
+- Wrap buildHandler in pkg/mcp/server.go with instrumentation middleware
+- Use otel.Tracer("mcp-k8s-networking") for span creation
+- Sanitize arguments before setting as span attribute (remove any keys containing "secret", "token", "key")
+- Truncate result to 1024 characters for span attribute
+- Satisfies: FR-OTel-1, FR-OTel-3, FR-OTel-6, FR-OTel-7
 
-### Story 12.3: K8s API Call Spans
+**Status:** done
+
+### Story 12.3: Context Propagation (Extract from params._meta) — NEW
+
+As a platform engineer,
+I want the MCP server to extract W3C trace context from MCP request params._meta,
+So that end-to-end traces flow from AI agent through MCP server to K8s API calls.
+
+**Acceptance Criteria:**
+
+**Given** an MCP request contains `params._meta.traceparent` and optionally `params._meta.tracestate`
+**When** the tool handler processes the request
+**Then** the extracted trace context becomes the parent of the tool invocation span
+
+**Given** an MCP request does NOT contain trace context in `params._meta`
+**When** the tool handler processes the request
+**Then** a new trace is started (no error, no warning)
+
+**Given** trace context is extracted from the incoming request
+**When** the tool makes K8s API calls
+**Then** the K8s API call spans are children of the tool invocation span (same trace)
+
+**Implementation Notes:**
+- Extract traceparent/tracestate from request params._meta map
+- Use otel.GetTextMapPropagator().Extract(ctx, carrier) with MapCarrier
+- This must happen before span creation in the middleware
+- Satisfies: FR-OTel-2
+
+**Status:** done
+
+### Story 12.4: Custom Domain Metrics (Findings + Errors) — NEW
+
+As a platform engineer,
+I want custom metrics tracking diagnostic findings and errors,
+So that I can monitor finding severity trends and error patterns.
+
+**Acceptance Criteria:**
+
+**Given** a tool invocation produces diagnostic findings
+**When** the response is returned
+**Then** `mcp.findings.total` counter is incremented for each finding, dimensioned by `severity` and `analyzer` (tool name)
+
+**Given** a tool invocation produces an error
+**When** the error is returned
+**Then** `mcp.errors.total` counter is incremented, dimensioned by `error.code` and `gen_ai.tool.name`
+
+**Implementation Notes:**
+- Create metrics in pkg/telemetry/ using otel.Meter("mcp-k8s-networking")
+- Record findings metrics in the middleware after inspecting ToolResult.Findings
+- Record error metrics in the middleware error handling path
+- Satisfies: FR-OTel-4
+
+**Status:** done
+
+### Story 12.5: slog → OTel Log Bridge with Trace Correlation — UPDATED
+
+As a platform engineer,
+I want slog output bridged to OTel Logs with automatic trace/span ID correlation,
+So that I can correlate logs with traces in my observability platform.
+
+**Acceptance Criteria:**
+
+**Given** the OTel LoggerProvider is configured
+**When** slog is initialized
+**Then** it uses the otelslog bridge handler to export logs via OTLP and inject trace context
+
+**Given** a tool invocation is in progress with an active span
+**When** any slog log line is emitted during that invocation
+**Then** the log record includes `trace_id` and `span_id` from the active span context
+
+**Given** tracing is disabled (no OTEL_EXPORTER_OTLP_ENDPOINT)
+**When** logs are emitted
+**Then** slog uses a standard JSON handler without OTel bridging
+
+**Implementation Notes:**
+- Use go.opentelemetry.io/contrib/bridges/otelslog to bridge slog with OTel
+- Create slog handler in pkg/telemetry/ that wraps otelslog when enabled
+- Return the handler from Init so main.go can set it as default
+- Satisfies: FR-OTel-5
+
+**Status:** done
+
+### Story 12.6: K8s API Call Spans
 
 As a platform engineer,
 I want K8s API calls to produce child spans,
@@ -1582,7 +1670,7 @@ So that I can identify slow API calls and diagnose latency issues in diagnostic 
 **Given** a tool makes a K8s API call (e.g., list pods, get service, get logs)
 **When** the API call executes
 **Then** a child span is created with:
-- Name: `k8s.api/{verb}/{resource}` (e.g., `k8s.api/list/services`, `k8s.api/get/pods/log`)
+- Name: `k8s.api/{verb}/{resource}` (e.g., `k8s.api/list/services`)
 - Attributes: `k8s.namespace`, `k8s.resource.kind`, `k8s.resource.name`, `http.status_code`
 - Duration: API call round-trip time
 
@@ -1590,16 +1678,13 @@ So that I can identify slow API calls and diagnose latency issues in diagnostic 
 **When** the span is recorded
 **Then** the span status is ERROR with the error details
 
-**Given** CRD discovery runs (startup or watch event)
-**When** discovery completes
-**Then** a span `k8s.discovery/crd_scan` is created with attributes: detected providers, duration
-
 **Implementation Notes:**
-- Wrap the K8s client methods in pkg/k8s/ with OTel span creation
-- Use client-go transport wrapper or wrap at the helper function level
+- Wrap K8s client methods in pkg/k8s/ or use client-go transport wrapper
 - CRD watch events get individual spans
 
-### Story 12.4: Probe Lifecycle Spans
+**Status:** backlog
+
+### Story 12.7: Probe Lifecycle Spans
 
 As a platform engineer,
 I want ephemeral probe operations to produce spans,
@@ -1609,45 +1694,13 @@ So that I can observe probe deployment times, execution latency, and cleanup.
 
 **Given** a probe is requested (connectivity, DNS, or HTTP)
 **When** the probe lifecycle executes
-**Then** a parent span `probe/{probe_type}` is created with child spans:
-- `probe.deploy` — pod creation time
-- `probe.wait_ready` — time waiting for pod to become Running
-- `probe.execute` — command execution time
-- `probe.cleanup` — pod deletion time
+**Then** a parent span `probe/{probe_type}` is created with child spans for deploy, wait, execute, cleanup
 
 **Given** a probe times out
 **When** the parent span is recorded
 **Then** it has status ERROR and a span event recording the timeout
 
-**Given** probe cleanup runs (orphan cleanup)
-**When** orphaned pods are deleted
-**Then** a span `probe.orphan_cleanup` is created with attribute: pods_cleaned count
-
 **Implementation Notes:**
 - Instrument pkg/probes/manager.go with spans for each lifecycle phase
-- Propagate trace context into probe execution
 
-### Story 12.5: Structured Log Correlation with Traces
-
-As a platform engineer,
-I want log entries to include trace and span IDs,
-So that I can correlate logs with traces in my observability platform.
-
-**Acceptance Criteria:**
-
-**Given** a tool invocation is in progress with an active trace
-**When** any slog log line is emitted during that invocation
-**Then** the log entry includes `trace_id` and `span_id` fields from the active span context
-
-**Given** the OTel trace provider is configured
-**When** slog is initialized
-**Then** it uses the otelslog bridge handler to inject trace context into structured logs
-
-**Given** tracing is disabled (no OTEL_EXPORTER_OTLP_ENDPOINT)
-**When** logs are emitted
-**Then** `trace_id` and `span_id` fields are absent (not empty strings)
-
-**Implementation Notes:**
-- Use go.opentelemetry.io/contrib/bridges/otelslog to bridge slog with OTel
-- This extends Story 1.3 (structured logging) with trace correlation
-- Replaces plain slog handler with otelslog-wrapped handler when tracing is enabled
+**Status:** backlog

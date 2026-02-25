@@ -31,12 +31,15 @@ func main() {
 
 	slog.Info("starting mcp-k8s-networking server", "cluster", cfg.ClusterName, "port", cfg.Port)
 
-	// Initialize OpenTelemetry tracer
-	tracerShutdown, err := telemetry.InitTracer(context.Background(), cfg.ClusterName)
+	// Initialize OpenTelemetry (traces + metrics + logs)
+	otelResult, err := telemetry.Init(context.Background(), cfg.ClusterName)
 	if err != nil {
-		slog.Error("failed to initialize tracer", "error", err)
+		slog.Error("failed to initialize telemetry", "error", err)
 		os.Exit(1)
 	}
+
+	// Replace default slog handler with OTel-bridged handler for trace correlation
+	slog.SetDefault(slog.New(otelResult.SlogHandler))
 
 	// Initialize K8s clients
 	clients, err := k8s.NewClients()
@@ -255,9 +258,9 @@ func main() {
 
 	probeMgr.Stop()
 
-	// Flush pending OTel spans before exit
-	if err := tracerShutdown(shutdownCtx); err != nil {
-		slog.Error("tracer shutdown error", "error", err)
+	// Flush pending OTel data (traces + metrics + logs) before exit
+	if err := otelResult.Shutdown(shutdownCtx); err != nil {
+		slog.Error("telemetry shutdown error", "error", err)
 	}
 
 	slog.Info("server stopped")

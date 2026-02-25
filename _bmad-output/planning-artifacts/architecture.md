@@ -420,6 +420,97 @@ features:
   enableFlannel: auto
 ```
 
+## ADR: OpenTelemetry GenAI + MCP Semantic Conventions
+
+### Decision
+
+Adopt the OpenTelemetry GenAI semantic conventions and MCP-specific attributes for all MCP server self-instrumentation. All three OTel signals (traces, metrics, logs) are emitted via OTLP gRPC. The instrumentation follows a middleware pattern that wraps every MCP tool call handler.
+
+### Context
+
+The MCP server needs observability into tool execution performance, error rates, and end-to-end trace correlation from AI agent through to K8s API calls. The OTel GenAI semantic conventions (https://opentelemetry.io/docs/specs/semconv/gen-ai/) define standard attribute names for AI/ML tool invocations. The MCP protocol has emerging conventions for session and method tracing.
+
+### Middleware Pattern
+
+All MCP tool calls are instrumented via a middleware wrapper in `pkg/mcp/server.go` that intercepts the `buildHandler` function:
+
+```
+AI Agent (traceparent in params._meta)
+  │
+  ▼ (extract W3C trace context)
+MCP Tool Call Middleware (pkg/mcp/server.go)
+  │ ─── Creates span: "execute_tool {tool_name}"
+  │ ─── Sets GenAI + MCP span attributes
+  │ ─── Records request duration metric
+  │
+  ▼ (propagated context)
+Tool.Run(ctx, args)
+  │
+  ▼ (child spans for K8s API calls)
+K8s API Server
+```
+
+### Span Attribute Mapping
+
+Every MCP tool invocation span carries these attributes:
+
+| Attribute | Source | Example |
+|---|---|---|
+| `gen_ai.operation.name` | Constant | `"execute_tool"` |
+| `gen_ai.tool.name` | `tool.Name()` | `"list_services"` |
+| `mcp.method.name` | JSON-RPC method | `"tools/call"` |
+| `mcp.protocol.version` | MCP version | `"2025-03-26"` |
+| `mcp.session.id` | Session context | `"sess_abc123"` |
+| `jsonrpc.request.id` | Request ID | `"req_42"` |
+| `gen_ai.tool.call.arguments` | Sanitized args JSON | `{"namespace":"default"}` |
+| `gen_ai.tool.call.result` | Truncated result (1024 chars) | `{"cluster":"prod",...}` |
+| `error.type` | MCPError code or `"tool_error"` | `"PROVIDER_NOT_FOUND"` |
+
+### Context Propagation
+
+W3C Trace Context (`traceparent`/`tracestate`) is extracted from `params._meta` in the MCP request. This enables end-to-end traces: AI agent → MCP server → K8s API. The extracted context becomes the parent of the tool invocation span. If no trace context is present, a new trace is started.
+
+```go
+// Extract from params._meta
+if meta, ok := request.Params.Meta; ok {
+    carrier := propagation.MapCarrier(meta)
+    ctx = otel.GetTextMapPropagator().Extract(ctx, carrier)
+}
+```
+
+### Metrics
+
+**GenAI semantic convention metrics:**
+- `gen_ai.server.request.duration` (histogram, seconds) — tool execution time, dimensioned by `gen_ai.tool.name`, `error.type`
+- `gen_ai.server.request.count` (counter) — tool invocation count, dimensioned by `gen_ai.tool.name`, `error.type`
+
+**Custom domain metrics:**
+- `mcp.findings.total` (counter) — diagnostic findings emitted, dimensioned by `severity`, `analyzer` (tool name)
+- `mcp.errors.total` (counter) — tool errors, dimensioned by `error.code`, `gen_ai.tool.name`
+
+### Log Bridge
+
+slog output is bridged to OTel Logs via `go.opentelemetry.io/contrib/bridges/otelslog`. When an active span context exists, every log entry is automatically enriched with `trace_id` and `span_id` for cross-signal correlation. When tracing is disabled, logs emit normally without trace fields.
+
+### Telemetry Package (pkg/telemetry/)
+
+The `pkg/telemetry/` package initializes all three signal providers:
+
+- `TracerProvider` with OTLP gRPC trace exporter
+- `MeterProvider` with OTLP gRPC metric exporter (periodic reader, 30s interval)
+- `LoggerProvider` with OTLP gRPC log exporter (batch processor)
+
+All providers share a common `resource.Resource` with `service.name`, `service.version`, and `k8s.cluster.name`. When `OTEL_EXPORTER_OTLP_ENDPOINT` is not set, noop providers are used and the server operates without telemetry overhead.
+
+### Consequences
+
+- Every MCP tool call produces a span with consistent attributes — enables dashboards and alerting on tool performance
+- End-to-end traces from agent to K8s API — enables root cause analysis for slow diagnostics
+- GenAI metrics enable SLO monitoring on tool response times
+- Custom metrics enable monitoring of diagnostic finding patterns (severity spikes, error trends)
+- Log-trace correlation enables jumping from a log entry to its full trace in observability platforms
+- Minimal performance overhead — noop providers when telemetry is disabled
+
 ## Implementation Patterns & Consistency Rules
 
 ### Critical Conflict Points Identified

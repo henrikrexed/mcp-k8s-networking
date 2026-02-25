@@ -473,6 +473,17 @@ k8s-networking-mcp/
 
 - FR50: The agent can request suggested remediations for identified diagnostic issues across all diagnostic domains (Istio, Gateway API, kgateway, CoreDNS, NetworkPolicy, kube-proxy) — each suggestion includes the affected resource, a description of the corrective action, and when applicable an annotated YAML snippet showing the fix
 
+### OpenTelemetry Self-Instrumentation
+
+- FR-OTel-1: All MCP tool calls MUST produce spans following OTel MCP semantic conventions — each span carries `mcp.method.name`, `gen_ai.tool.name`, `gen_ai.operation.name="execute_tool"`, `mcp.protocol.version`, `mcp.session.id`, and `jsonrpc.request.id` as span attributes
+- FR-OTel-2: Context propagation — the MCP server extracts `traceparent`/`tracestate` from MCP request `params._meta` to establish end-to-end traces spanning AI agent → MCP server → K8s API calls
+- FR-OTel-3: GenAI metrics — the MCP server records `gen_ai.server.request.duration` histogram and `gen_ai.server.request.count` counter, both dimensioned by tool name and error type
+- FR-OTel-4: Custom domain metrics — the MCP server records `mcp.findings.total` counter (by severity, analyzer/tool) and `mcp.errors.total` counter (by error code, tool name)
+- FR-OTel-5: Structured logging via OTel log bridge — slog output is bridged to OTel Logs via `otelslog`, with automatic `trace_id`/`span_id` correlation on every log entry emitted within an active span context
+- FR-OTel-6: Span attributes include `gen_ai.tool.call.arguments` (sanitized — no secrets, tokens, or certificate keys) and `gen_ai.tool.call.result` (truncated to 1024 characters) for diagnostic observability
+- FR-OTel-7: Error spans set `error.type` attribute to the JSON-RPC error code (e.g., `PROVIDER_NOT_FOUND`, `INVALID_INPUT`) or `"tool_error"` for unclassified tool execution failures, and record the error as a span event
+- FR-OTel-8: All three OTel signals (traces, metrics, logs) are exported via OTLP gRPC to the endpoint configured by `OTEL_EXPORTER_OTLP_ENDPOINT`, with noop providers when the endpoint is not set
+
 ### Deployment & Operations
 
 - FR45: A cluster administrator can deploy the MCP server via Helm chart with configurable RBAC scope and resource limits
