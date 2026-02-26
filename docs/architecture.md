@@ -2,17 +2,20 @@
 
 ## High-Level Overview
 
-```
-AI Agent <--MCP/HTTP--> MCP Server <--K8s API--> Kubernetes Cluster
-                           |
-                    +------+------+
-                    |             |
-              Tool Registry   CRD Discovery
-                    |             |
-              +-----+-----+     Watch
-              |     |     |   CRD events
-           Core  Gateway  Istio  ...
-           Tools  API     Tools
+```mermaid
+flowchart TD
+    Agent["AI Agent"] <-->|MCP / HTTP| MCP["MCP Server"]
+    MCP <-->|K8s API| K8s["Kubernetes Cluster"]
+
+    MCP --- TR["Tool Registry"]
+    MCP --- CD["CRD Discovery"]
+
+    TR --- Core["Core Tools"]
+    TR --- GW["Gateway API Tools"]
+    TR --- Istio["Istio Tools"]
+    TR --- More["..."]
+
+    CD -->|Watch CRD events| K8s
 ```
 
 ## Components

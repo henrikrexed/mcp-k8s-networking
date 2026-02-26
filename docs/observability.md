@@ -50,8 +50,9 @@ Every MCP tool call produces a span following GenAI + MCP semantic conventions.
 
 The server extracts W3C Trace Context (`traceparent`/`tracestate`) from `params._meta` in each MCP request. This enables **end-to-end traces** spanning:
 
-```
-AI Agent → MCP Server → K8s API
+```mermaid
+flowchart LR
+    Agent["AI Agent"] -->|traceparent| MCP["MCP Server"] -->|propagated ctx| K8s["K8s API"]
 ```
 
 If your AI agent sets `traceparent` in the `_meta` field of tool call requests, the MCP server will join those traces automatically.

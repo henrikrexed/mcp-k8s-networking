@@ -434,20 +434,20 @@ The MCP server needs observability into tool execution performance, error rates,
 
 All MCP tool calls are instrumented via a middleware wrapper in `pkg/mcp/server.go` that intercepts the `buildHandler` function:
 
-```
-AI Agent (traceparent in params._meta)
-  │
-  ▼ (extract W3C trace context)
-MCP Tool Call Middleware (pkg/mcp/server.go)
-  │ ─── Creates span: "execute_tool {tool_name}"
-  │ ─── Sets GenAI + MCP span attributes
-  │ ─── Records request duration metric
-  │
-  ▼ (propagated context)
-Tool.Run(ctx, args)
-  │
-  ▼ (child spans for K8s API calls)
-K8s API Server
+```mermaid
+flowchart TD
+    Agent["AI Agent<br/><i>traceparent in params._meta</i>"]
+    MW["MCP Tool Call Middleware<br/><code>pkg/mcp/server.go</code>"]
+    Tool["Tool.Run(ctx, args)"]
+    K8s["K8s API Server"]
+
+    Agent -->|"extract W3C trace context"| MW
+    MW -->|"propagated context"| Tool
+    Tool -->|"child spans for K8s API calls"| K8s
+
+    MW -.- S1(["Creates span: execute_tool"])
+    MW -.- S2(["Sets GenAI + MCP span attributes"])
+    MW -.- S3(["Records request duration metric"])
 ```
 
 ### Span Attribute Mapping
@@ -927,28 +927,25 @@ k8s-networking-mcp/
 
 ### Data Flow
 
-```
-AI Agent
-  │
-  ▼ (Streamable HTTP + JSON-RPC 2.0)
-pkg/mcp/server.go ──► pkg/mcp/auth.go (TokenReview)
-  │
-  ▼ (tool call with params)
-pkg/dispatcher/dispatcher.go
-  │
-  ├──► pkg/providers/istio/*.go ──► pkg/k8s/client.go ──► K8s API
-  ├──► pkg/providers/gateway/*.go ──► pkg/k8s/client.go ──► K8s API
-  ├──► pkg/providers/k8s/*.go ──► pkg/k8s/client.go ──► K8s API
-  └──► pkg/probes/manager.go ──► pkg/k8s/client.go ──► K8s API (create/delete pods)
-  │
-  ▼ ([]DiagnosticFinding)
-pkg/dispatcher/aggregator.go (if multi-provider)
-  │
-  ▼ (ToolResult with ClusterMetadata)
-pkg/mcp/handler.go (compact/detail formatting)
-  │
-  ▼ (JSON-RPC response)
-AI Agent
+```mermaid
+flowchart TD
+    Agent1["AI Agent"] -->|"Streamable HTTP + JSON-RPC 2.0"| Server["pkg/mcp/server.go"]
+    Server --> Auth["pkg/mcp/auth.go<br/>(TokenReview)"]
+    Server -->|"tool call with params"| Dispatcher["pkg/dispatcher/dispatcher.go"]
+
+    Dispatcher --> Istio["pkg/providers/istio/*.go"]
+    Dispatcher --> Gateway["pkg/providers/gateway/*.go"]
+    Dispatcher --> CoreK8s["pkg/providers/k8s/*.go"]
+    Dispatcher --> Probes["pkg/probes/manager.go"]
+
+    Istio --> Client1["pkg/k8s/client.go"] --> API1["K8s API"]
+    Gateway --> Client2["pkg/k8s/client.go"] --> API2["K8s API"]
+    CoreK8s --> Client3["pkg/k8s/client.go"] --> API3["K8s API"]
+    Probes --> Client4["pkg/k8s/client.go"] --> API4["K8s API<br/>(create/delete pods)"]
+
+    Dispatcher -->|"[]DiagnosticFinding"| Aggregator["pkg/dispatcher/aggregator.go<br/>(if multi-provider)"]
+    Aggregator -->|"ToolResult with ClusterMetadata"| Handler["pkg/mcp/handler.go<br/>(compact/detail formatting)"]
+    Handler -->|"JSON-RPC response"| Agent2["AI Agent"]
 ```
 
 ### Development Workflow
