@@ -78,8 +78,76 @@ http://mcp-k8s-networking.mcp-k8s-networking.svc.cluster.local:8080/mcp
 
 If exposed via Gateway API HTTPRoute, use the configured hostname.
 
+## Enable Observability
+
+mcp-k8s-networking exports traces, metrics, and logs via OTLP gRPC. To enable it, point the server at an OpenTelemetry Collector.
+
+### Via Helm Values
+
+```yaml
+otel:
+  enabled: true
+  endpoint: "otel-collector.observability.svc.cluster.local:4317"
+  insecure: true
+  serviceName: "mcp-k8s-networking"
+```
+
+Or on the command line:
+
+```bash
+helm install mcp-k8s-networking ./deploy/helm/mcp-k8s-networking \
+  --namespace mcp-k8s-networking \
+  --create-namespace \
+  --set config.clusterName=my-cluster \
+  --set otel.enabled=true \
+  --set otel.endpoint="otel-collector.observability.svc.cluster.local:4317"
+```
+
+### Via Environment Variables
+
+If deploying without Helm, set these on the container:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector.observability.svc.cluster.local:4317
+OTEL_EXPORTER_OTLP_INSECURE=true
+OTEL_SERVICE_NAME=mcp-k8s-networking
+```
+
+### Minimal OTel Collector Config
+
+Deploy an OTel Collector that receives from the MCP server:
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+exporters:
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [debug]
+    metrics:
+      receivers: [otlp]
+      exporters: [debug]
+    logs:
+      receivers: [otlp]
+      exporters: [debug]
+```
+
+Replace the `debug` exporter with your backend of choice. Supported backends include **Dynatrace**, **Grafana** (Tempo + Mimir + Loki), **Jaeger**, **Zipkin**, **Datadog**, and any OTLP-compatible endpoint.
+
+See the full [Observability guide](observability.md) for backend-specific configuration examples.
+
 ## Next Steps
 
 - Browse the [Tools Reference](tools/index.md) to see available diagnostics
 - Review [Configuration](configuration.md) for all environment variables
 - Read the [Architecture](architecture.md) overview
+- Learn how to [register this MCP server in your AI agent](mcp-skill-installation.md)

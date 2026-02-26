@@ -43,6 +43,52 @@ kubectl apply -f deploy/manifests/install.yaml
 
 See the [Getting Started](getting-started.md) guide for full details.
 
+## Register in Your AI Agent
+
+Connect your AI agent to the MCP server for instant access to K8s networking diagnostics:
+
+=== "Claude Desktop"
+
+    ```json
+    {
+      "mcpServers": {
+        "mcp-k8s-networking": {
+          "url": "http://localhost:8080/mcp",
+          "transport": "streamable-http"
+        }
+      }
+    }
+    ```
+
+=== "Cursor / VS Code"
+
+    ```json
+    {
+      "mcp": {
+        "servers": {
+          "mcp-k8s-networking": {
+            "url": "http://localhost:8080/mcp",
+            "transport": "streamable-http"
+          }
+        }
+      }
+    }
+    ```
+
+=== "kagent (K8s)"
+
+    ```yaml
+    apiVersion: kagent.dev/v1alpha1
+    kind: MCPServer
+    metadata:
+      name: mcp-k8s-networking
+    spec:
+      url: "http://mcp-k8s-networking.mcp-k8s-networking.svc:8080/mcp"
+      transport: streamable-http
+    ```
+
+See the full [MCP Skill Installation](mcp-skill-installation.md) guide for Claude Code, OpenClaw, and troubleshooting.
+
 ## Observability
 
 mcp-k8s-networking has built-in OpenTelemetry instrumentation that exports traces, metrics, and logs via OTLP gRPC. Enable it by setting the `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable or the `otel.enabled` Helm value.

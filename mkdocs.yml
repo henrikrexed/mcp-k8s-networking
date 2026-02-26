@@ -30,6 +30,7 @@ nav:
   - Home: index.md
   - Getting Started:
     - Quick Start: getting-started.md
+    - MCP Skill Installation: mcp-skill-installation.md
     - Configuration: configuration.md
     - Observability: observability.md
   - Tools Reference:
