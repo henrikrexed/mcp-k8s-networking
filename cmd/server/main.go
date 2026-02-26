@@ -214,16 +214,16 @@ func main() {
 	healthMux := http.NewServeMux()
 	healthMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "ok")
+		_, _ = fmt.Fprint(w, "ok")
 	})
 	healthMux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
 		if !disc.IsReady() {
 			w.WriteHeader(http.StatusServiceUnavailable)
-			fmt.Fprint(w, "not ready: initial CRD discovery pending")
+			_, _ = fmt.Fprint(w, "not ready: initial CRD discovery pending")
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "ok")
+		_, _ = fmt.Fprint(w, "ok")
 	})
 
 	// Start health check server on a separate port

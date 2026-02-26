@@ -516,7 +516,7 @@ func getPodLogs(ctx context.Context, clients *k8s.Clients, namespace, podName, c
 	if err != nil {
 		return nil, fmt.Errorf("failed to get logs for %s/%s/%s: %w", namespace, podName, container, err)
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 
 	// Read up to maxLogBytes+1 to detect truncation
 	data, err := io.ReadAll(io.LimitReader(stream, maxLogBytes+1))

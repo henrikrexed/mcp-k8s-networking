@@ -1,6 +1,6 @@
 module github.com/isitobservable/k8s-networking-mcp
 
-go 1.23.0
+go 1.25.0
 
 require (
 	github.com/modelcontextprotocol/go-sdk v1.3.1

@@ -153,7 +153,7 @@ func collectLogs(ctx context.Context, clients *k8s.Clients, namespace, podName s
 		slog.Warn("probe: failed to get logs", "pod", podName, "error", err)
 		return ""
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 
 	var buf bytes.Buffer
 	// Limit log output to 64KB
