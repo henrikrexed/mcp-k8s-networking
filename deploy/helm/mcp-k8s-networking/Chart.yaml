@@ -12,8 +12,8 @@ keywords:
   - gateway-api
   - istio
   - service-mesh
-home: https://github.com/isitobservable/k8s-networking-mcp
+home: https://github.com/henrikrexed/k8s-networking-mcp
 sources:
-  - https://github.com/isitobservable/k8s-networking-mcp
+  - https://github.com/henrikrexed/k8s-networking-mcp
 maintainers:
-  - name: isitobservable
+  - name: henrikrexed

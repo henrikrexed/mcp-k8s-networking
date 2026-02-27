@@ -23,8 +23,8 @@ A Model Context Protocol (MCP) server for Kubernetes networking diagnostics — 
 ### Helm (recommended)
 
 ```bash
-helm repo add isitobservable https://henrikrexed.github.io/mcp-k8s-networking
-helm install mcp-k8s-networking isitobservable/mcp-k8s-networking \
+helm repo add henrikrexed https://henrikrexed.github.io/mcp-k8s-networking
+helm install mcp-k8s-networking henrikrexed/mcp-k8s-networking \
   --namespace tools --create-namespace
 ```
 

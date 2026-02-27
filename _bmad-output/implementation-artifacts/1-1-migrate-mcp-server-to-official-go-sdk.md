@@ -95,7 +95,7 @@ All tool files (`pkg/tools/*.go`), registry (`pkg/tools/registry.go`), types (`p
 
 ### Project Structure Notes
 
-- Module: `github.com/isitobservable/k8s-networking-mcp`
+- Module: `github.com/henrikrexed/k8s-networking-mcp`
 - Go version: 1.25.0
 - MCP server: `pkg/mcp/server.go` (single file)
 - Entry point: `cmd/server/main.go`

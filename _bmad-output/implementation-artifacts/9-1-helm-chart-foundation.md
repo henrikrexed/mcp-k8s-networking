@@ -54,7 +54,7 @@ The default securityContext enforces: `runAsNonRoot: true`, `readOnlyRootFilesys
 
 | Section | Key | Default |
 |---|---|---|
-| image.repository | | ghcr.io/isitobservable/mcp-k8s-networking |
+| image.repository | | ghcr.io/henrikrexed/mcp-k8s-networking |
 | image.tag | | "" (defaults to appVersion) |
 | config.clusterName | | "" (required at install) |
 | config.port | | 8080 |

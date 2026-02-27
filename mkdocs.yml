@@ -1,8 +1,8 @@
 site_name: mcp-k8s-networking
 site_description: MCP server for Kubernetes networking diagnostics
-site_url: https://isitobservable.github.io/k8s-networking-mcp/
-repo_url: https://github.com/isitobservable/k8s-networking-mcp
-repo_name: isitobservable/k8s-networking-mcp
+site_url: https://henrikrexed.github.io/k8s-networking-mcp/
+repo_url: https://github.com/henrikrexed/k8s-networking-mcp
+repo_name: henrikrexed/k8s-networking-mcp
 
 theme:
   name: material

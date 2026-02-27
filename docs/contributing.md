@@ -4,7 +4,7 @@
 
 ```bash
 # Clone
-git clone https://github.com/isitobservable/k8s-networking-mcp.git
+git clone https://github.com/henrikrexed/k8s-networking-mcp.git
 cd k8s-networking-mcp
 
 # Build
