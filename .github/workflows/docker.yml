@@ -39,13 +39,13 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/hrexed/mcp-k8s-networking:${{ steps.version.outputs.VERSION }}
-            ghcr.io/hrexed/mcp-k8s-networking:latest
+            ghcr.io/henrikrexed/mcp-k8s-networking:${{ steps.version.outputs.VERSION }}
+            ghcr.io/henrikrexed/mcp-k8s-networking:latest
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@0.31.0
         with:
-          image-ref: ghcr.io/hrexed/mcp-k8s-networking:${{ steps.version.outputs.VERSION }}
+          image-ref: ghcr.io/henrikrexed/mcp-k8s-networking:${{ steps.version.outputs.VERSION }}
           format: table
           exit-code: '1'
           severity: CRITICAL,HIGH
