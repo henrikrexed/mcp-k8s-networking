@@ -89,3 +89,17 @@ kubectl apply -f deploy/kubernetes/service.yaml
 ```
 
 Edit `deploy/kubernetes/deployment.yaml` to set your `CLUSTER_NAME` and OTLP endpoint before deploying.
+
+### Deploy with Sympozium
+
+[Sympozium](https://sympozium.ai) is a Kubernetes AI agent orchestrator that uses SkillPack CRDs to inject MCP servers as sidecars into agent pods.
+
+```bash
+kubectl apply -f deploy/sympozium/skillpack.yaml
+```
+
+The SkillPack automatically provisions:
+- The MCP server as a sidecar container
+- Namespace-scoped RBAC for networking resources (Services, Ingresses, Gateway API, Istio, Cilium)
+- Cluster-scoped RBAC for nodes and namespaces
+- Shared `/workspace` volume for agent communication

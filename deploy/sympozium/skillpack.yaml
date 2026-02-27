@@ -1,0 +1,74 @@
+apiVersion: sympozium.ai/v1alpha1
+kind: SkillPack
+metadata:
+  name: mcp-k8s-networking
+spec:
+  category: kubernetes/networking
+  version: "0.1.0"
+  skills:
+    - name: diagnose-networking
+      description: Triage Kubernetes networking issues using the MCP server
+      content: |
+        # Kubernetes Networking Diagnostics
+
+        You have access to an MCP server at http://localhost:8080/mcp that provides
+        Kubernetes networking diagnostic tools. Use streamable-http transport.
+
+        ## Available Tools
+
+        - **diagnose_route** — Analyze HTTPRoute/Ingress for misconfigurations
+        - **diagnose_gateway** — Check Gateway resource health and listeners
+        - **diagnose_service** — Validate Service-to-Pod connectivity
+        - **diagnose_networkpolicy** — Analyze NetworkPolicy rules and coverage
+        - **diagnose_dns** — DNS resolution diagnostics
+        - **probe_connectivity** — Active connectivity testing between pods/services
+        - **design_guidance** — Architecture recommendations for networking patterns
+
+        ## Triage Workflow
+
+        1. Start with `diagnose_service` to check basic connectivity
+        2. Use `diagnose_dns` if DNS-related issues are suspected
+        3. Check `diagnose_networkpolicy` for blocked traffic
+        4. For ingress issues, use `diagnose_route` and `diagnose_gateway`
+        5. Use `probe_connectivity` for active end-to-end testing
+        6. For architecture questions, use `design_guidance`
+
+        ## Service Mesh Support
+
+        The server understands Istio VirtualServices/DestinationRules,
+        Cilium CiliumNetworkPolicy, and Gateway API resources natively.
+  sidecar:
+    image: ghcr.io/henrikrexed/mcp-k8s-networking:0.0.1
+    command: ["/mcp-k8s-networking"]
+    env:
+      - name: PORT
+        value: "8080"
+      - name: CLUSTER_NAME
+        value: "default"
+    mountWorkspace: true
+    resources:
+      cpu: "100m"
+      memory: "128Mi"
+    rbac:
+      - apiGroups: [""]
+        resources: ["services", "endpoints", "pods", "configmaps", "events"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["networking.k8s.io"]
+        resources: ["ingresses", "networkpolicies", "ingressclasses"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["gateway.networking.k8s.io"]
+        resources: ["gateways", "httproutes", "grpcroutes", "tcproutes", "tlsroutes", "referencegrants", "gatewayclasses"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["networking.istio.io"]
+        resources: ["virtualservices", "destinationrules", "gateways", "serviceentries", "sidecars"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["cilium.io"]
+        resources: ["ciliumnetworkpolicies", "ciliumclusterwidenetworkpolicies", "ciliumendpoints"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["discovery.k8s.io"]
+        resources: ["endpointslices"]
+        verbs: ["get", "list", "watch"]
+    clusterRBAC:
+      - apiGroups: [""]
+        resources: ["nodes", "namespaces"]
+        verbs: ["get", "list"]
