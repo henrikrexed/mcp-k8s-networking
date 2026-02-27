@@ -71,3 +71,21 @@ This project is part of the [IsItObservable](https://youtube.com/@IsItObservable
 ## License
 
 Apache License 2.0
+
+### Kubernetes Deployment (plain manifests)
+
+Deploy using kubectl or kustomize:
+
+```bash
+# Using kustomize
+kubectl apply -k deploy/kubernetes/
+
+# Or apply individually
+kubectl apply -f deploy/kubernetes/namespace.yaml
+kubectl apply -f deploy/kubernetes/serviceaccount.yaml
+kubectl apply -f deploy/kubernetes/rbac.yaml
+kubectl apply -f deploy/kubernetes/deployment.yaml
+kubectl apply -f deploy/kubernetes/service.yaml
+```
+
+Edit `deploy/kubernetes/deployment.yaml` to set your `CLUSTER_NAME` and OTLP endpoint before deploying.
