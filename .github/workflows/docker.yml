@@ -43,10 +43,10 @@ jobs:
             ghcr.io/henrikrexed/mcp-k8s-networking:latest
 
       - name: Scan image for vulnerabilities (Trivy)
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          scan-type: image
-          image-ref: ghcr.io/henrikrexed/mcp-k8s-networking:${{ steps.version.outputs.VERSION }}
-          format: table
-          exit-code: "0"
-          severity: CRITICAL,HIGH
+        run: |
+          docker run --rm \
+            ghcr.io/aquasecurity/trivy:latest image \
+            --severity CRITICAL,HIGH \
+            --exit-code 0 \
+            --format table \
+            ghcr.io/henrikrexed/mcp-k8s-networking:${{ steps.version.outputs.VERSION }}
