@@ -8,6 +8,6 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /mcp-k8s-networking ./cmd/server/
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=builder /mcp-k8s-networking /mcp-k8s-networking
-USER nonroot:nonroot
+USER 65532:65532
 EXPOSE 8080
 ENTRYPOINT ["/mcp-k8s-networking"]
