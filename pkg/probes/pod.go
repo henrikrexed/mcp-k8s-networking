@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -20,6 +22,21 @@ import (
 
 // podCounter provides unique pod names across concurrent probes.
 var podCounter atomic.Int64
+
+// traceparentEnv returns a TRACEPARENT env var from the current span context
+// so the probe pod's activity can be correlated with the parent trace.
+func traceparentEnv(ctx context.Context) []corev1.EnvVar {
+	sc := trace.SpanFromContext(ctx).SpanContext()
+	if !sc.HasTraceID() || !sc.HasSpanID() {
+		return nil
+	}
+	flags := "00"
+	if sc.IsSampled() {
+		flags = "01"
+	}
+	tp := fmt.Sprintf("00-%s-%s-%s", sc.TraceID().String(), sc.SpanID().String(), flags)
+	return []corev1.EnvVar{{Name: "TRACEPARENT", Value: tp}}
+}
 
 // createProbePod creates an ephemeral pod in the given namespace with the probe command.
 func createProbePod(ctx context.Context, clients *k8s.Clients, cfg *config.Config, namespace string, req ProbeRequest) (string, error) {
@@ -58,7 +75,8 @@ func createProbePod(ctx context.Context, clients *k8s.Clients, cfg *config.Confi
 							corev1.ResourceMemory: resource.MustParse("32Mi"),
 						},
 					},
-					SecurityContext: &corev1.SecurityContext{
+					Env: traceparentEnv(ctx),
+				SecurityContext: &corev1.SecurityContext{
 						RunAsNonRoot:             &trueVal,
 						RunAsUser:                &runAsUser,
 						AllowPrivilegeEscalation: &falseVal,
