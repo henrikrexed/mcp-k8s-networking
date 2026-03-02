@@ -3,9 +3,13 @@ package tools
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/isitobservable/k8s-networking-mcp/pkg/probes"
 	"github.com/isitobservable/k8s-networking-mcp/pkg/types"
@@ -29,6 +33,56 @@ func containsShellMeta(s string) bool {
 	return strings.ContainsAny(s, "'\"`;|&$(){}[]<>!\\#~")
 }
 
+// servicePort holds a resolved K8s Service port.
+type servicePort struct {
+	Name     string
+	Port     int32
+	Protocol string
+}
+
+// parseK8sServiceHost attempts to parse a hostname as a K8s service reference.
+// Returns (serviceName, namespace, ok). fallbackNS is used when hostname is a bare name.
+func parseK8sServiceHost(host, fallbackNS string) (name, namespace string, ok bool) {
+	parts := strings.Split(host, ".")
+	switch {
+	case len(parts) >= 3 && parts[2] == "svc":
+		return parts[0], parts[1], true
+	case len(parts) == 2:
+		return parts[0], parts[1], true
+	case len(parts) == 1 && fallbackNS != "":
+		return parts[0], fallbackNS, true
+	default:
+		return "", "", false
+	}
+}
+
+// resolveServicePorts looks up a K8s Service by hostname and returns its ports.
+func resolveServicePorts(ctx context.Context, bt *BaseTool, host, fallbackNS string) ([]servicePort, error) {
+	svcName, namespace, ok := parseK8sServiceHost(host, fallbackNS)
+	if !ok {
+		return nil, fmt.Errorf("not a K8s service hostname: %s", host)
+	}
+
+	svc, err := bt.Clients.Clientset.CoreV1().Services(namespace).Get(ctx, svcName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get service %s/%s: %w", namespace, svcName, err)
+	}
+
+	ports := make([]servicePort, 0, len(svc.Spec.Ports))
+	for _, p := range svc.Spec.Ports {
+		proto := string(p.Protocol)
+		if proto == "" {
+			proto = "TCP"
+		}
+		ports = append(ports, servicePort{
+			Name:     p.Name,
+			Port:     p.Port,
+			Protocol: proto,
+		})
+	}
+	return ports, nil
+}
+
 // --- probe_connectivity ---
 
 type ProbeConnectivityTool struct {
@@ -38,7 +92,7 @@ type ProbeConnectivityTool struct {
 
 func (t *ProbeConnectivityTool) Name() string { return "probe_connectivity" }
 func (t *ProbeConnectivityTool) Description() string {
-	return "Deploy an ephemeral pod to test TCP network connectivity between namespaces or services"
+	return "Deploy an ephemeral pod to test TCP network connectivity between namespaces or services. When target_port is omitted and target_host is a K8s service, the port is auto-resolved from the Service spec; if the service exposes multiple ports, all are tested."
 }
 func (t *ProbeConnectivityTool) InputSchema() map[string]interface{} {
 	return map[string]interface{}{
@@ -54,21 +108,20 @@ func (t *ProbeConnectivityTool) InputSchema() map[string]interface{} {
 			},
 			"target_port": map[string]interface{}{
 				"type":        "integer",
-				"description": "Target port to test connectivity on",
+				"description": "Target port to test connectivity on. Optional: when omitted, the port is auto-resolved from the K8s Service; if the service has multiple ports, all are tested.",
 			},
 			"timeout_seconds": map[string]interface{}{
 				"type":        "integer",
 				"description": "Probe timeout in seconds (default: 10, max: 30)",
 			},
 		},
-		"required": []string{"target_host", "target_port"},
+		"required": []string{"target_host"},
 	}
 }
 
 func (t *ProbeConnectivityTool) Run(ctx context.Context, args map[string]interface{}) (*StandardResponse, error) {
 	sourceNS := getStringArg(args, "source_namespace", t.Cfg.ProbeNamespace)
 	targetHost := getStringArg(args, "target_host", "")
-	targetPort := getIntArg(args, "target_port", 80)
 	timeoutSec := getIntArg(args, "timeout_seconds", 10)
 
 	if targetHost == "" {
@@ -89,6 +142,37 @@ func (t *ProbeConnectivityTool) Run(ctx context.Context, args map[string]interfa
 		timeoutSec = 30
 	}
 
+	// Determine which port(s) to test
+	targetPort := getIntArg(args, "target_port", 0)
+	var ports []int
+	if targetPort > 0 {
+		ports = []int{targetPort}
+	} else {
+		resolved, err := resolveServicePorts(ctx, &t.BaseTool, targetHost, sourceNS)
+		if err != nil || len(resolved) == 0 {
+			slog.InfoContext(ctx, "service port resolution failed, defaulting to port 80", "host", targetHost, "error", err)
+			ports = []int{80}
+		} else {
+			ports = make([]int, 0, len(resolved))
+			for _, p := range resolved {
+				ports = append(ports, int(p.Port))
+			}
+		}
+	}
+
+	allFindings := make([]types.DiagnosticFinding, 0, len(ports))
+	for _, port := range ports {
+		findings, err := t.probePort(ctx, sourceNS, targetHost, port, timeoutSec)
+		if err != nil {
+			return nil, err
+		}
+		allFindings = append(allFindings, findings...)
+	}
+
+	return NewToolResultResponse(t.Cfg, t.Name(), allFindings, sourceNS, ""), nil
+}
+
+func (t *ProbeConnectivityTool) probePort(ctx context.Context, sourceNS, targetHost string, targetPort, timeoutSec int) ([]types.DiagnosticFinding, error) {
 	req := probes.ProbeRequest{
 		Type:      probes.ProbeTypeConnectivity,
 		Namespace: sourceNS,
@@ -126,7 +210,7 @@ func (t *ProbeConnectivityTool) Run(ctx context.Context, args map[string]interfa
 		})
 	}
 
-	return NewToolResultResponse(t.Cfg, t.Name(), findings, sourceNS, ""), nil
+	return findings, nil
 }
 
 // --- probe_dns ---
@@ -230,7 +314,7 @@ type ProbeHTTPTool struct {
 
 func (t *ProbeHTTPTool) Name() string { return "probe_http" }
 func (t *ProbeHTTPTool) Description() string {
-	return "Deploy an ephemeral pod to perform HTTP/HTTPS requests against services from within the cluster"
+	return "Deploy an ephemeral pod to perform HTTP/HTTPS requests against services from within the cluster. When the URL omits a port and the hostname is a K8s service, the port is auto-resolved from the Service spec; if the service exposes multiple ports, all are tested."
 }
 func (t *ProbeHTTPTool) InputSchema() map[string]interface{} {
 	return map[string]interface{}{
@@ -238,7 +322,7 @@ func (t *ProbeHTTPTool) InputSchema() map[string]interface{} {
 		"properties": map[string]interface{}{
 			"url": map[string]interface{}{
 				"type":        "string",
-				"description": "Target URL (e.g., http://my-service.default.svc.cluster.local:8080/health)",
+				"description": "Target URL (e.g., http://my-service.default.svc.cluster.local/health). When the port is omitted, it is auto-resolved from the K8s Service.",
 			},
 			"method": map[string]interface{}{
 				"type":        "string",
@@ -262,20 +346,20 @@ func (t *ProbeHTTPTool) InputSchema() map[string]interface{} {
 }
 
 func (t *ProbeHTTPTool) Run(ctx context.Context, args map[string]interface{}) (*StandardResponse, error) {
-	url := getStringArg(args, "url", "")
+	rawURL := getStringArg(args, "url", "")
 	method := getStringArg(args, "method", "GET")
 	headers := getStringArg(args, "headers", "")
 	sourceNS := getStringArg(args, "source_namespace", t.Cfg.ProbeNamespace)
 	timeoutSec := getIntArg(args, "timeout_seconds", 10)
 
-	if url == "" {
+	if rawURL == "" {
 		return nil, &types.MCPError{
 			Code:    types.ErrCodeInvalidInput,
 			Tool:    t.Name(),
 			Message: "url is required",
 		}
 	}
-	if containsShellMeta(url) {
+	if containsShellMeta(rawURL) {
 		return nil, &types.MCPError{
 			Code:    types.ErrCodeInvalidInput,
 			Tool:    t.Name(),
@@ -290,6 +374,37 @@ func (t *ProbeHTTPTool) Run(ctx context.Context, args map[string]interface{}) (*
 		timeoutSec = 30
 	}
 
+	// Determine which URL(s) to test. If the URL has no port and the hostname
+	// looks like a K8s service, resolve the port(s) from the Service spec.
+	urls := []string{rawURL}
+	u, parseErr := url.Parse(rawURL)
+	if parseErr == nil && u.Host != "" && !strings.Contains(u.Host, ":") {
+		resolved, resolveErr := resolveServicePorts(ctx, &t.BaseTool, u.Hostname(), sourceNS)
+		if resolveErr != nil {
+			slog.InfoContext(ctx, "service port resolution failed for HTTP probe, using URL as-is", "host", u.Hostname(), "error", resolveErr)
+		} else if len(resolved) > 0 {
+			urls = make([]string, 0, len(resolved))
+			for _, p := range resolved {
+				u2 := *u
+				u2.Host = fmt.Sprintf("%s:%d", u.Hostname(), p.Port)
+				urls = append(urls, u2.String())
+			}
+		}
+	}
+
+	allFindings := make([]types.DiagnosticFinding, 0, len(urls))
+	for _, testURL := range urls {
+		findings, err := t.probeURL(ctx, sourceNS, method, headers, timeoutSec, testURL)
+		if err != nil {
+			return nil, err
+		}
+		allFindings = append(allFindings, findings...)
+	}
+
+	return NewToolResultResponse(t.Cfg, t.Name(), allFindings, sourceNS, ""), nil
+}
+
+func (t *ProbeHTTPTool) probeURL(ctx context.Context, sourceNS, method, headers string, timeoutSec int, targetURL string) ([]types.DiagnosticFinding, error) {
 	// Build curl command
 	curlCmd := fmt.Sprintf("curl -s -o /tmp/body -w '%%{http_code}|%%{time_total}|%%{ssl_verify_result}' -X %s --max-time %d -L", method, timeoutSec)
 
@@ -302,7 +417,7 @@ func (t *ProbeHTTPTool) Run(ctx context.Context, args map[string]interface{}) (*
 		}
 	}
 
-	curlCmd += fmt.Sprintf(" %s", url)
+	curlCmd += fmt.Sprintf(" %s", targetURL)
 	curlCmd += " 2>&1; echo; echo '---BODY---'; head -c 1024 /tmp/body 2>/dev/null || true"
 
 	req := probes.ProbeRequest{
@@ -351,7 +466,7 @@ func (t *ProbeHTTPTool) Run(ctx context.Context, args map[string]interface{}) (*
 		findings = append(findings, types.DiagnosticFinding{
 			Severity: severity,
 			Category: types.CategoryConnectivity,
-			Summary:  fmt.Sprintf("HTTP %s %s returned %s in %s", method, url, statusCode, responseTime),
+			Summary:  fmt.Sprintf("HTTP %s %s returned %s in %s", method, targetURL, statusCode, responseTime),
 			Detail:   fmt.Sprintf("status=%s response_time=%s body_snippet=%s", statusCode, responseTime, bodySnippet),
 		})
 	} else {
@@ -362,11 +477,11 @@ func (t *ProbeHTTPTool) Run(ctx context.Context, args map[string]interface{}) (*
 		findings = append(findings, types.DiagnosticFinding{
 			Severity:   types.SeverityCritical,
 			Category:   types.CategoryConnectivity,
-			Summary:    fmt.Sprintf("HTTP %s %s failed (connection error or timeout)", method, url),
+			Summary:    fmt.Sprintf("HTTP %s %s failed (connection error or timeout)", method, targetURL),
 			Detail:     detail,
 			Suggestion: "Check that the target service is running, DNS resolves correctly, and there are no NetworkPolicies or mTLS requirements blocking the connection.",
 		})
 	}
 
-	return NewToolResultResponse(t.Cfg, t.Name(), findings, sourceNS, ""), nil
+	return findings, nil
 }
