@@ -62,7 +62,7 @@ func Load() (*Config, error) {
 
 	probeImage := os.Getenv("PROBE_IMAGE")
 	if probeImage == "" {
-		probeImage = "ghcr.io/mcp-k8s-networking/probe:latest"
+		probeImage = "nicolaka/netshoot:latest"
 	}
 
 	maxProbes := 5
