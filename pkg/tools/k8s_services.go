@@ -110,6 +110,7 @@ func (t *GetServiceTool) InputSchema() map[string]interface{} {
 
 func (t *GetServiceTool) Run(ctx context.Context, args map[string]interface{}) (*StandardResponse, error) {
 	name := getStringArg(args, "name", "")
+	if name == "" { name = getStringArg(args, "service_name", "") }
 	ns := getStringArg(args, "namespace", "default")
 
 	svc, err := t.Clients.Dynamic.Resource(servicesGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
