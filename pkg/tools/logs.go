@@ -487,7 +487,17 @@ func (t *AnalyzeLogErrorsTool) Run(ctx context.Context, args map[string]interfac
 // Helper functions
 
 func findProxyContainer(pod *corev1.Pod) string {
+	// Check regular containers first
 	for _, c := range pod.Spec.Containers {
+		for _, proxyName := range proxyContainerNames {
+			if c.Name == proxyName {
+				return c.Name
+			}
+		}
+	}
+	// Check init containers for Kubernetes native sidecars (K8s 1.28+)
+	// Native sidecars run as init containers with restartPolicy=Always
+	for _, c := range pod.Spec.InitContainers {
 		for _, proxyName := range proxyContainerNames {
 			if c.Name == proxyName {
 				return c.Name

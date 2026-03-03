@@ -494,8 +494,18 @@ func checkPodHasSidecar(ctx context.Context, client dynamic.Interface, ns string
 	if podErr != nil || len(podList.Items) == 0 {
 		return false
 	}
+	// Check regular containers
 	containers, _, _ := unstructured.NestedSlice(podList.Items[0].Object, "spec", "containers")
 	for _, c := range containers {
+		if cm, ok := c.(map[string]interface{}); ok {
+			if name, ok := cm["name"].(string); ok && name == "istio-proxy" {
+				return true
+			}
+		}
+	}
+	// Check init containers for Kubernetes native sidecars (K8s 1.28+)
+	initContainers, _, _ := unstructured.NestedSlice(podList.Items[0].Object, "spec", "initContainers")
+	for _, c := range initContainers {
 		if cm, ok := c.(map[string]interface{}); ok {
 			if name, ok := cm["name"].(string); ok && name == "istio-proxy" {
 				return true
