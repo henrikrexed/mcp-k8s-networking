@@ -70,46 +70,42 @@ func SeverityIcon(severity string) string {
 	}
 }
 
-// ToText renders a DiagnosticFinding as a compact single line.
-func (f DiagnosticFinding) ToText() string {
-	line := SeverityIcon(f.Severity) + " "
-	if f.Resource != nil {
-		line += f.Resource.Kind + " "
-		if f.Resource.Namespace != "" {
-			line += f.Resource.Namespace + "/"
-		}
-		line += f.Resource.Name + " | "
-	}
-	line += f.Summary
-	if f.Detail != "" {
-		line += " | " + f.Detail
-	}
-	if f.Suggestion != "" {
-		line += " → " + f.Suggestion
-	}
-	return line
-}
-
-// FindingsToText renders a slice of findings as compact newline-separated text.
+// FindingsToText renders findings as a compact markdown table.
 func FindingsToText(findings []DiagnosticFinding) string {
 	if len(findings) == 0 {
 		return "(no findings)"
 	}
-	lines := make([]string, len(findings))
-	for i, f := range findings {
-		lines[i] = f.ToText()
-	}
-	return strings.Join(lines, "\n")
-}
 
-// ToolResultToText renders a ToolResult as compact text.
-func (tr *ToolResult) ToText() string {
-	header := "cluster=" + tr.Metadata.ClusterName
-	if tr.Metadata.Namespace != "" {
-		header += " ns=" + tr.Metadata.Namespace
+	var sb strings.Builder
+	sb.WriteString("| St | Resource | Summary | Detail |\n")
+	sb.WriteString("|----|----------|---------|--------|\n")
+	for _, f := range findings {
+		res := "-"
+		if f.Resource != nil {
+			res = f.Resource.Kind
+			if f.Resource.Namespace != "" {
+				res += " " + f.Resource.Namespace + "/" + f.Resource.Name
+			} else {
+				res += " " + f.Resource.Name
+			}
+		}
+		detail := f.Detail
+		if f.Suggestion != "" {
+			if detail != "" {
+				detail += " → "
+			}
+			detail += f.Suggestion
+		}
+
+		// Escape pipes in content
+		res = strings.ReplaceAll(res, "|", "\\|")
+		summary := strings.ReplaceAll(f.Summary, "|", "\\|")
+		detail = strings.ReplaceAll(detail, "|", "\\|")
+		// Replace newlines
+		summary = strings.ReplaceAll(summary, "\n", " ")
+		detail = strings.ReplaceAll(detail, "\n", " ")
+
+		sb.WriteString("| " + SeverityIcon(f.Severity) + " | " + res + " | " + summary + " | " + detail + " |\n")
 	}
-	if tr.Metadata.Provider != "" {
-		header += " provider=" + tr.Metadata.Provider
-	}
-	return header + "\n" + FindingsToText(tr.Findings)
+	return sb.String()
 }

@@ -16,3 +16,15 @@ type ToolResult struct {
 	Metadata ClusterMetadata     `json:"metadata"`
 	IsError  bool                `json:"isError,omitempty"`
 }
+
+// ToText renders a ToolResult as a compact markdown table.
+func (tr *ToolResult) ToText() string {
+	header := "cluster=" + tr.Metadata.ClusterName
+	if tr.Metadata.Namespace != "" {
+		header += " ns=" + tr.Metadata.Namespace
+	}
+	if tr.Metadata.Provider != "" {
+		header += " provider=" + tr.Metadata.Provider
+	}
+	return header + "\n" + FindingsToText(tr.Findings)
+}
