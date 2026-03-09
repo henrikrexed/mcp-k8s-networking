@@ -2,7 +2,6 @@ package tools
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -268,21 +267,15 @@ func (t *ValidateKgatewayResourceTool) Run(ctx context.Context, args map[string]
 
 	var findings []types.DiagnosticFinding
 
-	// Resource summary with spec in detail
-	summary, _ := kgatewayResourceSummary(kind, resource)
-	spec, _, _ := unstructured.NestedMap(resource.Object, "spec")
-	specJSON, jsonErr := json.MarshalIndent(spec, "", "  ")
-	if jsonErr != nil {
-		slog.Warn("kgateway: failed to marshal spec to JSON", "kind", kind, "name", name, "error", jsonErr)
-		specJSON = []byte(fmt.Sprintf("<failed to serialize spec: %v>", jsonErr))
-	}
+	// Resource summary (no full spec dump to save tokens)
+	summary, detail := kgatewayResourceSummary(kind, resource)
 
 	findings = append(findings, types.DiagnosticFinding{
 		Severity: types.SeverityInfo,
 		Category: types.CategoryMesh,
 		Resource: ref,
 		Summary:  summary,
-		Detail:   string(specJSON),
+		Detail:   detail,
 	})
 
 	// Check status conditions

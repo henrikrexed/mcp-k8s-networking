@@ -2,7 +2,6 @@ package tools
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -176,21 +175,15 @@ func (t *GetIstioResourceTool) Run(ctx context.Context, args map[string]interfac
 
 	var findings []types.DiagnosticFinding
 
-	// Main resource finding with summary and full spec in Detail
-	summary, _ := istioResourceSummary(kind, resource)
-	spec, _, _ := unstructured.NestedMap(resource.Object, "spec")
-	specJSON, jsonErr := json.MarshalIndent(spec, "", "  ")
-	if jsonErr != nil {
-		slog.Warn("istio: failed to marshal spec to JSON", "kind", kind, "name", name, "error", jsonErr)
-		specJSON = []byte(fmt.Sprintf("<failed to serialize spec: %v>", jsonErr))
-	}
+	// Main resource finding with summary (no full spec dump to save tokens)
+	summary, detail := istioResourceSummary(kind, resource)
 
 	findings = append(findings, types.DiagnosticFinding{
 		Severity: types.SeverityInfo,
 		Category: types.CategoryMesh,
 		Resource: ref,
 		Summary:  summary,
-		Detail:   string(specJSON),
+		Detail:   detail,
 	})
 
 	// Extract status validation messages
