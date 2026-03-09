@@ -58,8 +58,10 @@ func getWithFallback(ctx context.Context, client dynamic.Interface, v1, v1beta1 
 
 type ListGatewaysTool struct{ BaseTool }
 
-func (t *ListGatewaysTool) Name() string        { return "list_gateways" }
-func (t *ListGatewaysTool) Description() string  { return "List Gateway API gateways with listeners, status conditions, and attached route count" }
+func (t *ListGatewaysTool) Name() string { return "list_gateways" }
+func (t *ListGatewaysTool) Description() string {
+	return "List Gateway API gateways with listeners, status conditions, and attached route count"
+}
 func (t *ListGatewaysTool) InputSchema() map[string]interface{} {
 	return map[string]interface{}{
 		"type": "object",
@@ -153,8 +155,10 @@ func (t *ListGatewaysTool) Run(ctx context.Context, args map[string]interface{})
 
 type GetGatewayTool struct{ BaseTool }
 
-func (t *GetGatewayTool) Name() string        { return "get_gateway" }
-func (t *GetGatewayTool) Description() string  { return "Get full Gateway detail: listeners, addresses, conditions, and attached routes" }
+func (t *GetGatewayTool) Name() string { return "get_gateway" }
+func (t *GetGatewayTool) Description() string {
+	return "Get full Gateway detail: listeners, addresses, conditions, and attached routes"
+}
 func (t *GetGatewayTool) InputSchema() map[string]interface{} {
 	return map[string]interface{}{
 		"type": "object",
@@ -324,8 +328,10 @@ func (t *GetGatewayTool) Run(ctx context.Context, args map[string]interface{}) (
 
 type ListHTTPRoutesTool struct{ BaseTool }
 
-func (t *ListHTTPRoutesTool) Name() string        { return "list_httproutes" }
-func (t *ListHTTPRoutesTool) Description() string  { return "List HTTPRoutes with parent refs, backend refs, and rule count" }
+func (t *ListHTTPRoutesTool) Name() string { return "list_httproutes" }
+func (t *ListHTTPRoutesTool) Description() string {
+	return "List HTTPRoutes with parent refs, backend refs, and rule count"
+}
 func (t *ListHTTPRoutesTool) InputSchema() map[string]interface{} {
 	return map[string]interface{}{
 		"type": "object",
@@ -415,8 +421,10 @@ func (t *ListHTTPRoutesTool) Run(ctx context.Context, args map[string]interface{
 
 type GetHTTPRouteTool struct{ BaseTool }
 
-func (t *GetHTTPRouteTool) Name() string        { return "get_httproute" }
-func (t *GetHTTPRouteTool) Description() string  { return "Get full HTTPRoute: rules, matches, filters, backend refs with health" }
+func (t *GetHTTPRouteTool) Name() string { return "get_httproute" }
+func (t *GetHTTPRouteTool) Description() string {
+	return "Get full HTTPRoute: rules, matches, filters, backend refs with health"
+}
 func (t *GetHTTPRouteTool) InputSchema() map[string]interface{} {
 	return map[string]interface{}{
 		"type": "object",
@@ -661,8 +669,10 @@ func (t *GetHTTPRouteTool) Run(ctx context.Context, args map[string]interface{})
 
 type ListGRPCRoutesTool struct{ BaseTool }
 
-func (t *ListGRPCRoutesTool) Name() string        { return "list_grpcroutes" }
-func (t *ListGRPCRoutesTool) Description() string  { return "List GRPCRoutes with parent refs, backend refs, and rule counts" }
+func (t *ListGRPCRoutesTool) Name() string { return "list_grpcroutes" }
+func (t *ListGRPCRoutesTool) Description() string {
+	return "List GRPCRoutes with parent refs, backend refs, and rule counts"
+}
 func (t *ListGRPCRoutesTool) InputSchema() map[string]interface{} {
 	return map[string]interface{}{
 		"type": "object",
@@ -752,8 +762,10 @@ func (t *ListGRPCRoutesTool) Run(ctx context.Context, args map[string]interface{
 
 type GetGRPCRouteTool struct{ BaseTool }
 
-func (t *GetGRPCRouteTool) Name() string        { return "get_grpcroute" }
-func (t *GetGRPCRouteTool) Description() string  { return "Get full GRPCRoute: method matching rules, backend refs with health, and status conditions" }
+func (t *GetGRPCRouteTool) Name() string { return "get_grpcroute" }
+func (t *GetGRPCRouteTool) Description() string {
+	return "Get full GRPCRoute: method matching rules, backend refs with health, and status conditions"
+}
 func (t *GetGRPCRouteTool) InputSchema() map[string]interface{} {
 	return map[string]interface{}{
 		"type": "object",
@@ -999,8 +1011,10 @@ func (t *GetGRPCRouteTool) Run(ctx context.Context, args map[string]interface{})
 
 type ListReferenceGrantsTool struct{ BaseTool }
 
-func (t *ListReferenceGrantsTool) Name() string        { return "list_referencegrants" }
-func (t *ListReferenceGrantsTool) Description() string  { return "List ReferenceGrants with from/to resource specifications for cross-namespace reference validation" }
+func (t *ListReferenceGrantsTool) Name() string { return "list_referencegrants" }
+func (t *ListReferenceGrantsTool) Description() string {
+	return "List ReferenceGrants with from/to resource specifications for cross-namespace reference validation"
+}
 func (t *ListReferenceGrantsTool) InputSchema() map[string]interface{} {
 	return map[string]interface{}{
 		"type": "object",
@@ -1080,8 +1094,10 @@ func (t *ListReferenceGrantsTool) Run(ctx context.Context, args map[string]inter
 
 type GetReferenceGrantTool struct{ BaseTool }
 
-func (t *GetReferenceGrantTool) Name() string        { return "get_referencegrant" }
-func (t *GetReferenceGrantTool) Description() string  { return "Get full ReferenceGrant spec: allowed from-namespaces, from-kinds, to-kinds, to-names, and cross-namespace validation" }
+func (t *GetReferenceGrantTool) Name() string { return "get_referencegrant" }
+func (t *GetReferenceGrantTool) Description() string {
+	return "Get full ReferenceGrant spec: allowed from-namespaces, from-kinds, to-kinds, to-names, and cross-namespace validation"
+}
 func (t *GetReferenceGrantTool) InputSchema() map[string]interface{} {
 	return map[string]interface{}{
 		"type": "object",
@@ -1215,8 +1231,8 @@ func (t *GetReferenceGrantTool) Run(ctx context.Context, args map[string]interfa
 						})
 					} else {
 						findings = append(findings, types.DiagnosticFinding{
-							Severity:   types.SeverityWarning,
-							Category:   types.CategoryPolicy,
+							Severity: types.SeverityWarning,
+							Category: types.CategoryPolicy,
 							Resource: &types.ResourceRef{
 								Kind:       "HTTPRoute",
 								Namespace:  routeNs,
@@ -1389,9 +1405,35 @@ func (t *ScanGatewayMisconfigsTool) Run(ctx context.Context, args map[string]int
 			}
 			refName, _ := prm["name"].(string)
 			refNs, _ := prm["namespace"].(string)
+			refKind, _ := prm["kind"].(string)
+			refGroup, _ := prm["group"].(string)
 			if refNs == "" {
 				refNs = route.namespace
 			}
+
+			// GAMMA (Gateway API for Mesh): routes can reference Services
+			// as parentRefs for east-west mesh traffic. This is valid and
+			// should not be flagged as a missing Gateway.
+			if refKind == "Service" || (refKind == "" && refGroup == "") {
+				// If kind is Service, or kind is explicitly set to a non-Gateway kind, skip gateway lookup.
+				// Default kind is "Gateway" per spec, but if "Service" is set this is a GAMMA mesh route.
+				if refKind == "Service" {
+					// Validate the Service exists
+					svcKey := refNs + "/" + refName
+					_, err := t.Clients.Clientset.CoreV1().Services(refNs).Get(ctx, refName, metav1.GetOptions{})
+					if err != nil {
+						findings = append(findings, types.DiagnosticFinding{
+							Severity:   types.SeverityWarning,
+							Category:   types.CategoryRouting,
+							Resource:   routeRef,
+							Summary:    fmt.Sprintf("%s %s/%s references non-existent Service %s (GAMMA mesh route)", route.kind, route.namespace, route.name, svcKey),
+							Suggestion: fmt.Sprintf("Create Service %s or update the parentRef", svcKey),
+						})
+					}
+					continue
+				}
+			}
+
 			gwKey := refNs + "/" + refName
 			if _, exists := gatewaysByKey[gwKey]; !exists {
 				findings = append(findings, types.DiagnosticFinding{
