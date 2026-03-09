@@ -258,24 +258,18 @@ func (s *Server) buildInstrumentedHandler(t tools.Tool) mcp.ToolHandler {
 			}
 		}
 
-		jsonBytes, err := json.MarshalIndent(result, "", "  ")
-		if err != nil {
-			s.recordError(ctx, span, t.Name(), "INTERNAL_ERROR", err)
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("failed to marshal result: %v", err)}},
-				IsError: true,
-			}, nil
-		}
+		// Render as compact text for LLM token efficiency
+		resultText := result.ToText()
 
 		// Set truncated result as span attribute
-		resultStr := string(jsonBytes)
-		if len(resultStr) > maxResultAttrLen {
-			resultStr = resultStr[:maxResultAttrLen]
+		resultAttr := resultText
+		if len(resultAttr) > maxResultAttrLen {
+			resultAttr = resultAttr[:maxResultAttrLen]
 		}
-		span.SetAttributes(attribute.String("gen_ai.tool.call.result", resultStr))
+		span.SetAttributes(attribute.String("gen_ai.tool.call.result", resultAttr))
 
 		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: string(jsonBytes)}},
+			Content: []mcp.Content{&mcp.TextContent{Text: resultText}},
 		}, nil
 	}
 }

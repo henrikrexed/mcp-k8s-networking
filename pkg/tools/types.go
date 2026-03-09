@@ -4,6 +4,10 @@ import (
 	"context"
 	"time"
 
+	"encoding/json"
+	"fmt"
+	"strings"
+
 	"github.com/isitobservable/k8s-networking-mcp/pkg/config"
 	"github.com/isitobservable/k8s-networking-mcp/pkg/k8s"
 	"github.com/isitobservable/k8s-networking-mcp/pkg/types"
@@ -74,4 +78,31 @@ func NewToolResultResponse(cfg *config.Config, toolName string, findings []types
 			},
 		},
 	}
+}
+
+// ToText renders the StandardResponse as compact text for LLM consumption.
+// If Data is a *types.ToolResult, uses the structured text formatter.
+// Otherwise falls back to a simple key=value format.
+func (r *StandardResponse) ToText() string {
+	header := fmt.Sprintf("[%s] %s", r.Tool, r.Cluster)
+
+	if tr, ok := r.Data.(*types.ToolResult); ok {
+		return header + "\n" + tr.ToText()
+	}
+
+	// For non-ToolResult data (e.g. map responses), use compact key=value
+	if m, ok := r.Data.(map[string]interface{}); ok {
+		var parts []string
+		for k, v := range m {
+			parts = append(parts, fmt.Sprintf("%s=%v", k, v))
+		}
+		return header + " | " + strings.Join(parts, " | ")
+	}
+
+	// Fallback: marshal to JSON but keep it compact (no indent)
+	b, err := json.Marshal(r.Data)
+	if err != nil {
+		return header + " | (error formatting data)"
+	}
+	return header + "\n" + string(b)
 }
