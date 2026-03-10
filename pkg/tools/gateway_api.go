@@ -379,10 +379,26 @@ func (t *ListHTTPRoutesTool) Run(ctx context.Context, args map[string]interface{
 			}
 		}
 
-		// Extract backend refs from rules
+		// Extract method matchers and backend refs from rules
 		backendRefParts := make([]string, 0)
+		methodParts := make([]string, 0)
 		for _, r := range rules {
 			if rm, ok := r.(map[string]interface{}); ok {
+				// Method matchers
+				if matches, ok := rm["matches"].([]interface{}); ok {
+					for _, m := range matches {
+						if mm, ok := m.(map[string]interface{}); ok {
+							if method, ok := mm["method"].(map[string]interface{}); ok {
+								svc, _ := method["service"].(string)
+								meth, _ := method["method"].(string)
+								if svc != "" || meth != "" {
+									methodParts = append(methodParts, fmt.Sprintf("%s/%s", svc, meth))
+								}
+							}
+						}
+					}
+				}
+				// Backend refs
 				if brs, ok := rm["backendRefs"].([]interface{}); ok {
 					for _, br := range brs {
 						if brm, ok := br.(map[string]interface{}); ok {
@@ -395,10 +411,18 @@ func (t *ListHTTPRoutesTool) Run(ctx context.Context, args map[string]interface{
 			}
 		}
 
-		summary := fmt.Sprintf("%s/%s parents=[%s] rules=%d backends=[%s]",
+		methodInfo := ""
+		if len(methodParts) > 0 {
+			methodInfo = fmt.Sprintf(" methods=[%s]", strings.Join(methodParts, ", "))
+		} else if len(rules) > 0 {
+			methodInfo = " methods=[*catch-all*]"
+		}
+
+		summary := fmt.Sprintf("%s/%s parents=[%s] rules=%d%s backends=[%s]",
 			item.GetNamespace(), item.GetName(),
 			strings.Join(parentRefParts, ", "),
 			len(rules),
+			methodInfo,
 			strings.Join(backendRefParts, ", "))
 
 		findings = append(findings, types.DiagnosticFinding{
