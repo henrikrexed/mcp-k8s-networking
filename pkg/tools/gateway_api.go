@@ -54,6 +54,200 @@ func getWithFallback(ctx context.Context, client dynamic.Interface, v1, v1beta1 
 	return client.Resource(v1beta1).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
 }
 
+// formatParentRef returns a string like "Gateway:ns/name" or "Service:name" (Gamma mesh routing).
+func formatParentRef(pr map[string]interface{}) string {
+	refName, _ := pr["name"].(string)
+	refNs, _ := pr["namespace"].(string)
+	kind, _ := pr["kind"].(string)
+	group, _ := pr["group"].(string)
+	section, _ := pr["sectionName"].(string)
+
+	// Determine kind label
+	kindLabel := ""
+	if kind == "Service" || (kind == "" && group == "") {
+		// Default kind is Gateway, but if group is "" and kind is "Service", it's Gamma
+		if kind == "Service" {
+			kindLabel = "Service"
+		}
+	}
+	if kind == "Gateway" || (kind == "" && (group == "gateway.networking.k8s.io" || group == "")) {
+		if kindLabel == "" {
+			kindLabel = "Gateway"
+		}
+	}
+	if kindLabel == "" {
+		kindLabel = kind
+	}
+
+	part := refName
+	if refNs != "" {
+		part = refNs + "/" + part
+	}
+	if section != "" {
+		part += "/" + section
+	}
+	if kindLabel != "" && kindLabel != "Gateway" {
+		part = kindLabel + ":" + part
+	}
+	return part
+}
+
+// extractHTTPRuleMatchers extracts path, method, header matchers from an HTTPRoute rule.
+func extractHTTPRuleMatchers(rm map[string]interface{}) []string {
+	var parts []string
+	matches, ok := rm["matches"].([]interface{})
+	if !ok || len(matches) == 0 {
+		return []string{"*"}
+	}
+	for _, m := range matches {
+		mm, ok := m.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		var matchStr []string
+		// Path match
+		if path, ok := mm["path"].(map[string]interface{}); ok {
+			pType, _ := path["type"].(string)
+			pVal, _ := path["value"].(string)
+			if pType == "" {
+				pType = "PathPrefix"
+			}
+			matchStr = append(matchStr, fmt.Sprintf("%s(%s)", pType, pVal))
+		}
+		// HTTP method
+		if method, ok := mm["method"].(string); ok && method != "" {
+			matchStr = append(matchStr, fmt.Sprintf("method(%s)", method))
+		}
+		// Headers
+		if headers, ok := mm["headers"].([]interface{}); ok {
+			for _, h := range headers {
+				if hm, ok := h.(map[string]interface{}); ok {
+					hName, _ := hm["name"].(string)
+					hVal, _ := hm["value"].(string)
+					matchStr = append(matchStr, fmt.Sprintf("header(%s=%s)", hName, hVal))
+				}
+			}
+		}
+		if len(matchStr) > 0 {
+			parts = append(parts, strings.Join(matchStr, "+"))
+		}
+	}
+	return parts
+}
+
+// extractGRPCRuleMatchers extracts gRPC method matchers from a GRPCRoute rule.
+func extractGRPCRuleMatchers(rm map[string]interface{}) []string {
+	var parts []string
+	matches, ok := rm["matches"].([]interface{})
+	if !ok || len(matches) == 0 {
+		return []string{"*"}
+	}
+	for _, m := range matches {
+		mm, ok := m.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if method, ok := mm["method"].(map[string]interface{}); ok {
+			svc, _ := method["service"].(string)
+			meth, _ := method["method"].(string)
+			matchType, _ := method["type"].(string)
+			if matchType == "" {
+				matchType = "Exact"
+			}
+			if svc != "" || meth != "" {
+				parts = append(parts, fmt.Sprintf("%s/%s", svc, meth))
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return []string{"*"}
+	}
+	return parts
+}
+
+// extractBackendRefs extracts backend refs from a route rule.
+func extractBackendRefs(rm map[string]interface{}) []string {
+	var parts []string
+	brs, ok := rm["backendRefs"].([]interface{})
+	if !ok {
+		return parts
+	}
+	for _, br := range brs {
+		brm, ok := br.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		brName, _ := brm["name"].(string)
+		brPort := fmt.Sprintf("%v", brm["port"])
+		weight := ""
+		if w, ok := brm["weight"].(float64); ok {
+			weight = fmt.Sprintf("w=%d", int(w))
+		}
+		ref := fmt.Sprintf("%s:%s", brName, brPort)
+		if weight != "" {
+			ref += "(" + weight + ")"
+		}
+		parts = append(parts, ref)
+	}
+	return parts
+}
+
+// extractFilters extracts filter types from a route rule.
+func extractFilters(rm map[string]interface{}) []string {
+	var parts []string
+	filters, ok := rm["filters"].([]interface{})
+	if !ok {
+		return parts
+	}
+	for _, f := range filters {
+		fm, ok := f.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		fType, _ := fm["type"].(string)
+		parts = append(parts, fType)
+	}
+	return parts
+}
+
+// listAuthPoliciesForNamespace returns a map of targetRef name → policy names
+// for quick cross-referencing with routes and services.
+func listAuthPoliciesForNamespace(ctx context.Context, client dynamic.Interface, ns string) map[string][]string {
+	result := make(map[string][]string)
+
+	apV1GVR := schema.GroupVersionResource{Group: "security.istio.io", Version: "v1", Resource: "authorizationpolicies"}
+	apV1B1GVR := schema.GroupVersionResource{Group: "security.istio.io", Version: "v1beta1", Resource: "authorizationpolicies"}
+
+	list, err := listWithFallback(ctx, client, apV1GVR, apV1B1GVR, ns)
+	if err != nil {
+		return result
+	}
+
+	for _, item := range list.Items {
+		apName := item.GetName()
+		action, _, _ := unstructured.NestedString(item.Object, "spec", "action")
+		if action == "" {
+			action = "ALLOW"
+		}
+
+		// Check targetRef (newer Istio)
+		if targetRef, ok, _ := unstructured.NestedMap(item.Object, "spec", "targetRef"); ok {
+			if name, ok := targetRef["name"].(string); ok {
+				result[name] = append(result[name], fmt.Sprintf("%s(%s)", apName, action))
+			}
+		}
+
+		// Check selector matchLabels
+		if matchLabels, ok, _ := unstructured.NestedStringMap(item.Object, "spec", "selector", "matchLabels"); ok {
+			for _, v := range matchLabels {
+				result[v] = append(result[v], fmt.Sprintf("%s(%s)", apName, action))
+			}
+		}
+	}
+
+	return result
+}
+
 // --- list_gateways ---
 
 type ListGatewaysTool struct{ BaseTool }
@@ -357,73 +551,67 @@ func (t *ListHTTPRoutesTool) Run(ctx context.Context, args map[string]interface{
 		}
 	}
 
+	// Fetch AuthorizationPolicies in namespace for cross-reference
+	apMap := listAuthPoliciesForNamespace(ctx, t.Clients.Dynamic, ns)
+
 	findings := make([]types.DiagnosticFinding, 0, len(list.Items))
 	for _, item := range list.Items {
 		parentRefs, _, _ := unstructured.NestedSlice(item.Object, "spec", "parentRefs")
 		rules, _, _ := unstructured.NestedSlice(item.Object, "spec", "rules")
 
+		// Parent refs with kind (Gateway vs Service for Gamma)
 		parentRefParts := make([]string, 0, len(parentRefs))
 		for _, pr := range parentRefs {
 			if prm, ok := pr.(map[string]interface{}); ok {
-				refName, _ := prm["name"].(string)
-				refNs, _ := prm["namespace"].(string)
-				section, _ := prm["sectionName"].(string)
-				part := refName
-				if refNs != "" {
-					part = refNs + "/" + part
-				}
-				if section != "" {
-					part += "/" + section
-				}
-				parentRefParts = append(parentRefParts, part)
+				parentRefParts = append(parentRefParts, formatParentRef(prm))
 			}
 		}
 
-		// Extract method matchers and backend refs from rules
-		backendRefParts := make([]string, 0)
-		methodParts := make([]string, 0)
-		for _, r := range rules {
-			if rm, ok := r.(map[string]interface{}); ok {
-				// Method matchers
-				if matches, ok := rm["matches"].([]interface{}); ok {
-					for _, m := range matches {
-						if mm, ok := m.(map[string]interface{}); ok {
-							if method, ok := mm["method"].(map[string]interface{}); ok {
-								svc, _ := method["service"].(string)
-								meth, _ := method["method"].(string)
-								if svc != "" || meth != "" {
-									methodParts = append(methodParts, fmt.Sprintf("%s/%s", svc, meth))
-								}
-							}
-						}
-					}
-				}
-				// Backend refs
-				if brs, ok := rm["backendRefs"].([]interface{}); ok {
-					for _, br := range brs {
-						if brm, ok := br.(map[string]interface{}); ok {
-							brName, _ := brm["name"].(string)
-							brPort := fmt.Sprintf("%v", brm["port"])
-							backendRefParts = append(backendRefParts, fmt.Sprintf("%s:%s", brName, brPort))
-						}
-					}
-				}
+		// Per-rule details
+		var ruleSummaries []string
+		allBackends := make([]string, 0)
+		for i, r := range rules {
+			rm, ok := r.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			matchers := extractHTTPRuleMatchers(rm)
+			backends := extractBackendRefs(rm)
+			filters := extractFilters(rm)
+			allBackends = append(allBackends, backends...)
+
+			rs := fmt.Sprintf("r%d:match=[%s]→[%s]", i, strings.Join(matchers, ","), strings.Join(backends, ","))
+			if len(filters) > 0 {
+				rs += fmt.Sprintf(" filters=[%s]", strings.Join(filters, ","))
+			}
+			ruleSummaries = append(ruleSummaries, rs)
+		}
+
+		// Check for attached policies
+		routeName := item.GetName()
+		policyInfo := ""
+		if policies, ok := apMap[routeName]; ok {
+			policyInfo = fmt.Sprintf(" policies=[%s]", strings.Join(policies, ","))
+		}
+		// Also check policies targeting backend services
+		for _, backend := range allBackends {
+			svcName := strings.Split(backend, ":")[0]
+			if policies, ok := apMap[svcName]; ok {
+				policyInfo += fmt.Sprintf(" svc-policies(%s)=[%s]", svcName, strings.Join(policies, ","))
 			}
 		}
 
-		methodInfo := ""
-		if len(methodParts) > 0 {
-			methodInfo = fmt.Sprintf(" methods=[%s]", strings.Join(methodParts, ", "))
-		} else if len(rules) > 0 {
-			methodInfo = " methods=[*catch-all*]"
-		}
-
-		summary := fmt.Sprintf("%s/%s parents=[%s] rules=%d%s backends=[%s]",
+		summary := fmt.Sprintf("%s/%s parents=[%s] rules=%d backends=[%s]%s",
 			item.GetNamespace(), item.GetName(),
 			strings.Join(parentRefParts, ", "),
 			len(rules),
-			methodInfo,
-			strings.Join(backendRefParts, ", "))
+			strings.Join(allBackends, ", "),
+			policyInfo)
+
+		detail := ""
+		if len(ruleSummaries) > 0 {
+			detail = strings.Join(ruleSummaries, " | ")
+		}
 
 		findings = append(findings, types.DiagnosticFinding{
 			Severity: types.SeverityInfo,
@@ -435,6 +623,7 @@ func (t *ListHTTPRoutesTool) Run(ctx context.Context, args map[string]interface{
 				APIVersion: "gateway.networking.k8s.io",
 			},
 			Summary: summary,
+			Detail:  detail,
 		})
 	}
 
@@ -722,49 +911,62 @@ func (t *ListGRPCRoutesTool) Run(ctx context.Context, args map[string]interface{
 		}
 	}
 
+	// Fetch AuthorizationPolicies in namespace for cross-reference
+	apMap := listAuthPoliciesForNamespace(ctx, t.Clients.Dynamic, ns)
+
 	findings := make([]types.DiagnosticFinding, 0, len(list.Items))
 	for _, item := range list.Items {
 		parentRefs, _, _ := unstructured.NestedSlice(item.Object, "spec", "parentRefs")
 		rules, _, _ := unstructured.NestedSlice(item.Object, "spec", "rules")
 
+		// Parent refs with kind (Gateway vs Service for Gamma)
 		parentRefParts := make([]string, 0, len(parentRefs))
 		for _, pr := range parentRefs {
 			if prm, ok := pr.(map[string]interface{}); ok {
-				refName, _ := prm["name"].(string)
-				refNs, _ := prm["namespace"].(string)
-				section, _ := prm["sectionName"].(string)
-				part := refName
-				if refNs != "" {
-					part = refNs + "/" + part
-				}
-				if section != "" {
-					part += "/" + section
-				}
-				parentRefParts = append(parentRefParts, part)
+				parentRefParts = append(parentRefParts, formatParentRef(prm))
 			}
 		}
 
-		// Extract backend refs from rules
-		backendRefParts := make([]string, 0)
-		for _, r := range rules {
-			if rm, ok := r.(map[string]interface{}); ok {
-				if brs, ok := rm["backendRefs"].([]interface{}); ok {
-					for _, br := range brs {
-						if brm, ok := br.(map[string]interface{}); ok {
-							brName, _ := brm["name"].(string)
-							brPort := fmt.Sprintf("%v", brm["port"])
-							backendRefParts = append(backendRefParts, fmt.Sprintf("%s:%s", brName, brPort))
-						}
-					}
-				}
+		// Per-rule details
+		var ruleSummaries []string
+		allBackends := make([]string, 0)
+		for i, r := range rules {
+			rm, ok := r.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			methods := extractGRPCRuleMatchers(rm)
+			backends := extractBackendRefs(rm)
+			allBackends = append(allBackends, backends...)
+
+			rs := fmt.Sprintf("r%d:methods=[%s]→[%s]", i, strings.Join(methods, ","), strings.Join(backends, ","))
+			ruleSummaries = append(ruleSummaries, rs)
+		}
+
+		// Check for attached policies
+		routeName := item.GetName()
+		policyInfo := ""
+		if policies, ok := apMap[routeName]; ok {
+			policyInfo = fmt.Sprintf(" policies=[%s]", strings.Join(policies, ","))
+		}
+		for _, backend := range allBackends {
+			svcName := strings.Split(backend, ":")[0]
+			if policies, ok := apMap[svcName]; ok {
+				policyInfo += fmt.Sprintf(" svc-policies(%s)=[%s]", svcName, strings.Join(policies, ","))
 			}
 		}
 
-		summary := fmt.Sprintf("%s/%s parents=[%s] rules=%d backends=[%s]",
+		summary := fmt.Sprintf("%s/%s parents=[%s] rules=%d backends=[%s]%s",
 			item.GetNamespace(), item.GetName(),
 			strings.Join(parentRefParts, ", "),
 			len(rules),
-			strings.Join(backendRefParts, ", "))
+			strings.Join(allBackends, ", "),
+			policyInfo)
+
+		detail := ""
+		if len(ruleSummaries) > 0 {
+			detail = strings.Join(ruleSummaries, " | ")
+		}
 
 		findings = append(findings, types.DiagnosticFinding{
 			Severity: types.SeverityInfo,
@@ -776,6 +978,7 @@ func (t *ListGRPCRoutesTool) Run(ctx context.Context, args map[string]interface{
 				APIVersion: "gateway.networking.k8s.io",
 			},
 			Summary: summary,
+			Detail:  detail,
 		})
 	}
 
