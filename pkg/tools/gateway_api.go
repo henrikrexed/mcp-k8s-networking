@@ -205,7 +205,54 @@ func extractFilters(rm map[string]interface{}) []string {
 			continue
 		}
 		fType, _ := fm["type"].(string)
-		parts = append(parts, fType)
+
+		switch fType {
+		case "ExtensionRef":
+			if ext, ok := fm["extensionRef"].(map[string]interface{}); ok {
+				kind, _ := ext["kind"].(string)
+				name, _ := ext["name"].(string)
+				group, _ := ext["group"].(string)
+				// Show group only for non-obvious ones
+				groupLabel := ""
+				if group != "" && group != "gateway.networking.k8s.io" {
+					groupLabel = group + "/"
+				}
+				parts = append(parts, fmt.Sprintf("%s%s:%s", groupLabel, kind, name))
+			} else {
+				parts = append(parts, fType)
+			}
+		case "RequestHeaderModifier":
+			if rhm, ok := fm["requestHeaderModifier"].(map[string]interface{}); ok {
+				count := 0
+				if add, ok := rhm["add"].([]interface{}); ok {
+					count += len(add)
+				}
+				if set, ok := rhm["set"].([]interface{}); ok {
+					count += len(set)
+				}
+				if rm, ok := rhm["remove"].([]interface{}); ok {
+					count += len(rm)
+				}
+				parts = append(parts, fmt.Sprintf("HeaderMod(%d)", count))
+			} else {
+				parts = append(parts, fType)
+			}
+		case "ResponseHeaderModifier":
+			parts = append(parts, "RespHeaderMod")
+		case "RequestMirror":
+			if mirror, ok := fm["requestMirror"].(map[string]interface{}); ok {
+				if br, ok := mirror["backendRef"].(map[string]interface{}); ok {
+					name, _ := br["name"].(string)
+					parts = append(parts, fmt.Sprintf("Mirror→%s", name))
+				} else {
+					parts = append(parts, "Mirror")
+				}
+			} else {
+				parts = append(parts, fType)
+			}
+		default:
+			parts = append(parts, fType)
+		}
 	}
 	return parts
 }
