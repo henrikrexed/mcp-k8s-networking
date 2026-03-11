@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -185,6 +186,117 @@ func (t *GetIstioResourceTool) Run(ctx context.Context, args map[string]interfac
 		Summary:  summary,
 		Detail:   detail,
 	})
+
+	// VirtualService-specific enrichment: route weights, timeouts, retries
+	if kind == "VirtualService" {
+		httpRoutes, _, _ := unstructured.NestedSlice(resource.Object, "spec", "http")
+		for ri, route := range httpRoutes {
+			routeMap, ok := route.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			// Extract destinations with weights
+			routeDests, _, _ := unstructured.NestedSlice(routeMap, "route")
+			totalWeight := 0
+			hasExplicitWeight := false
+			var destParts []string
+
+			for _, dest := range routeDests {
+				destMap, ok := dest.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				destHost, _, _ := unstructured.NestedString(destMap, "destination", "host")
+				destSubset, _, _ := unstructured.NestedString(destMap, "destination", "subset")
+				weight, weightFound, _ := unstructured.NestedFloat64(destMap, "weight")
+
+				if weightFound {
+					hasExplicitWeight = true
+					totalWeight += int(weight)
+				}
+
+				dp := destHost
+				if destSubset != "" {
+					dp += "/" + destSubset
+				}
+				if weightFound {
+					dp += fmt.Sprintf("(w=%d)", int(weight))
+				}
+				destParts = append(destParts, dp)
+			}
+
+			// Show route summary with destinations
+			routeSummary := fmt.Sprintf("http[%d]: destinations=[%s]", ri, strings.Join(destParts, ", "))
+
+			// Extract timeout (conditional)
+			routeTimeout, _, _ := unstructured.NestedString(routeMap, "timeout")
+			if routeTimeout != "" {
+				routeSummary += fmt.Sprintf(" timeout=%s", routeTimeout)
+			}
+
+			// Extract retries (conditional)
+			retries, _, _ := unstructured.NestedMap(routeMap, "retries")
+			if retries != nil {
+				attempts, _, _ := unstructured.NestedFloat64(retries, "attempts")
+				perTryTimeout, _, _ := unstructured.NestedString(retries, "perTryTimeout")
+				retryOn, _, _ := unstructured.NestedString(retries, "retryOn")
+				retryParts := make([]string, 0, 3)
+				if attempts > 0 {
+					retryParts = append(retryParts, fmt.Sprintf("attempts=%d", int(attempts)))
+				}
+				if perTryTimeout != "" {
+					retryParts = append(retryParts, fmt.Sprintf("perTryTimeout=%s", perTryTimeout))
+				}
+				if retryOn != "" {
+					retryParts = append(retryParts, fmt.Sprintf("retryOn=%s", retryOn))
+				}
+				if len(retryParts) > 0 {
+					routeSummary += fmt.Sprintf(" retries={%s}", strings.Join(retryParts, ", "))
+				}
+			}
+
+			findings = append(findings, types.DiagnosticFinding{
+				Severity: types.SeverityInfo,
+				Category: types.CategoryMesh,
+				Resource: ref,
+				Summary:  routeSummary,
+			})
+
+			// Weight sum warning (conditional)
+			if hasExplicitWeight && len(routeDests) > 1 && totalWeight != 100 {
+				findings = append(findings, types.DiagnosticFinding{
+					Severity:   types.SeverityWarning,
+					Category:   types.CategoryMesh,
+					Resource:   ref,
+					Summary:    fmt.Sprintf("http[%d]: destination weights sum to %d, not 100", ri, totalWeight),
+					Suggestion: "Adjust route weights to sum to 100",
+				})
+			}
+
+			// Retry/timeout misconfiguration warning (conditional)
+			if routeTimeout != "" && retries != nil {
+				perTryTimeout, _, _ := unstructured.NestedString(retries, "perTryTimeout")
+				attempts, _, _ := unstructured.NestedFloat64(retries, "attempts")
+				if perTryTimeout != "" && attempts > 0 {
+					totalRetryDur, pErr := time.ParseDuration(perTryTimeout)
+					timeoutDur, tErr := time.ParseDuration(routeTimeout)
+					if pErr == nil && tErr == nil {
+						totalRetryDur = totalRetryDur * time.Duration(int(attempts))
+						if totalRetryDur > timeoutDur {
+							findings = append(findings, types.DiagnosticFinding{
+								Severity:   types.SeverityWarning,
+								Category:   types.CategoryMesh,
+								Resource:   ref,
+								Summary:    fmt.Sprintf("http[%d]: perTryTimeout(%s) × attempts(%d) = %s exceeds route timeout %s", ri, perTryTimeout, int(attempts), totalRetryDur, routeTimeout),
+								Suggestion: "Reduce retry attempts or perTryTimeout, or increase the route timeout",
+							})
+						}
+					}
+				}
+			}
+		}
+	}
 
 	// Extract status validation messages
 	status, _, _ := unstructured.NestedMap(resource.Object, "status")

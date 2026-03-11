@@ -981,6 +981,16 @@ func (t *GetHTTPRouteTool) Run(ctx context.Context, args map[string]interface{})
 		}
 	}
 
+	// Weight distribution and timeout validation per rule
+	for i, r := range rules {
+		rm, ok := r.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		findings = append(findings, checkRuleWeights(ctx, t.Clients.Dynamic, rm, ns, i, routeRef)...)
+		findings = append(findings, checkRuleTimeouts(rm, i, routeRef)...)
+	}
+
 	// Cross-namespace reference validation
 	for _, r := range rules {
 		rm, ok := r.(map[string]interface{})
@@ -1376,6 +1386,15 @@ func (t *GetGRPCRouteTool) Run(ctx context.Context, args map[string]interface{})
 				}
 			}
 		}
+	}
+
+	// Weight distribution validation per rule
+	for i, r := range rules {
+		rm, ok := r.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		findings = append(findings, checkRuleWeights(ctx, t.Clients.Dynamic, rm, ns, i, routeRef)...)
 	}
 
 	// Cross-namespace reference validation
@@ -2615,6 +2634,138 @@ func hasUnhealthyCondition(conditions []interface{}) bool {
 		}
 	}
 	return false
+}
+
+// checkRuleWeights validates weight distribution across backendRefs in a route rule.
+// Returns warnings when weights don't sum to 100 or when weighted backends have 0 endpoints.
+func checkRuleWeights(ctx context.Context, dynClient dynamic.Interface, rm map[string]interface{}, ns string, ruleIdx int, routeRef *types.ResourceRef) []types.DiagnosticFinding {
+	brs, ok := rm["backendRefs"].([]interface{})
+	if !ok || len(brs) < 2 {
+		return nil // Weight validation only meaningful with multiple backends
+	}
+
+	totalWeight := 0
+	hasExplicitWeight := false
+	type weightedBackend struct {
+		name   string
+		ns     string
+		weight int
+	}
+	var weightedBackends []weightedBackend
+
+	for _, br := range brs {
+		brm, ok := br.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		brName, _ := brm["name"].(string)
+		brNs := ns
+		if rns, ok := brm["namespace"].(string); ok && rns != "" {
+			brNs = rns
+		}
+		if w, ok := brm["weight"].(float64); ok {
+			hasExplicitWeight = true
+			totalWeight += int(w)
+			weightedBackends = append(weightedBackends, weightedBackend{name: brName, ns: brNs, weight: int(w)})
+		}
+	}
+
+	if !hasExplicitWeight {
+		return nil
+	}
+
+	var findings []types.DiagnosticFinding
+
+	// Check weight sum
+	if totalWeight != 100 {
+		findings = append(findings, types.DiagnosticFinding{
+			Severity:   types.SeverityWarning,
+			Category:   types.CategoryRouting,
+			Resource:   routeRef,
+			Summary:    fmt.Sprintf("Rule %d: backendRef weights sum to %d, not 100 — %d%% traffic unaccounted", ruleIdx, totalWeight, 100-totalWeight),
+			Suggestion: "Adjust backend weights to sum to 100",
+		})
+	}
+
+	// Check weighted backends with 0 ready endpoints
+	for _, wb := range weightedBackends {
+		if wb.weight == 0 {
+			continue
+		}
+		ep, err := dynClient.Resource(endpointsGVR).Namespace(wb.ns).Get(ctx, wb.name, metav1.GetOptions{})
+		if err != nil {
+			continue
+		}
+		subsets, _, _ := unstructured.NestedSlice(ep.Object, "subsets")
+		readyCount := 0
+		for _, s := range subsets {
+			if sm, ok := s.(map[string]interface{}); ok {
+				if addrs, ok := sm["addresses"].([]interface{}); ok {
+					readyCount += len(addrs)
+				}
+			}
+		}
+		if readyCount == 0 {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity:   types.SeverityWarning,
+				Category:   types.CategoryRouting,
+				Resource:   routeRef,
+				Summary:    fmt.Sprintf("Rule %d: backend %s has weight %d%% but 0 ready endpoints — this traffic will fail", ruleIdx, wb.name, wb.weight),
+				Suggestion: "Check that pods backing this service are running, or redistribute weights",
+			})
+		}
+	}
+
+	return findings
+}
+
+// checkRuleTimeouts extracts and validates HTTPRoute rule timeouts.
+// Returns info finding when timeouts are set, warning when misconfigured.
+func checkRuleTimeouts(rm map[string]interface{}, ruleIdx int, routeRef *types.ResourceRef) []types.DiagnosticFinding {
+	timeouts, ok := rm["timeouts"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	requestTimeout, _ := timeouts["request"].(string)
+	backendTimeout, _ := timeouts["backendRequest"].(string)
+	if requestTimeout == "" && backendTimeout == "" {
+		return nil
+	}
+
+	var findings []types.DiagnosticFinding
+
+	// Show timeout configuration
+	parts := make([]string, 0, 2)
+	if requestTimeout != "" {
+		parts = append(parts, fmt.Sprintf("request timeout %s", requestTimeout))
+	}
+	if backendTimeout != "" {
+		parts = append(parts, fmt.Sprintf("backend timeout %s", backendTimeout))
+	}
+
+	severity := types.SeverityInfo
+	suggestion := ""
+
+	// Check misconfiguration: backendRequest > request
+	if requestTimeout != "" && backendTimeout != "" {
+		reqDur, reqErr := time.ParseDuration(requestTimeout)
+		backDur, backErr := time.ParseDuration(backendTimeout)
+		if reqErr == nil && backErr == nil && backDur > reqDur {
+			severity = types.SeverityWarning
+			suggestion = "backendRequest timeout exceeds request timeout — backend timeout will never trigger"
+		}
+	}
+
+	findings = append(findings, types.DiagnosticFinding{
+		Severity:   severity,
+		Category:   types.CategoryRouting,
+		Resource:   routeRef,
+		Summary:    fmt.Sprintf("Rule %d: %s", ruleIdx, strings.Join(parts, ", ")),
+		Suggestion: suggestion,
+	})
+
+	return findings
 }
 
 // refGrantEntry represents a single ReferenceGrant from→to mapping.
