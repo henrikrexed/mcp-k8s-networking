@@ -282,7 +282,8 @@ func (t *GetIstioResourceTool) Run(ctx context.Context, args map[string]interfac
 					totalRetryDur, pErr := time.ParseDuration(perTryTimeout)
 					timeoutDur, tErr := time.ParseDuration(routeTimeout)
 					if pErr == nil && tErr == nil {
-						totalRetryDur = totalRetryDur * time.Duration(int(attempts))
+						// Total worst-case retry duration = perTryTimeout × attempts
+					totalRetryDur = totalRetryDur * time.Duration(int(attempts))
 						if totalRetryDur > timeoutDur {
 							findings = append(findings, types.DiagnosticFinding{
 								Severity:   types.SeverityWarning,
@@ -295,6 +296,40 @@ func (t *GetIstioResourceTool) Run(ctx context.Context, args map[string]interfac
 					}
 				}
 			}
+		}
+	}
+
+	// DestinationRule-specific enrichment: TLS mode, circuit breakers, outlier detection
+	if kind == "DestinationRule" {
+		// Surface TLS mode (Story 3.2)
+		tlsMode, _, _ := unstructured.NestedString(resource.Object, "spec", "trafficPolicy", "tls", "mode")
+		if tlsMode != "" {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity: types.SeverityInfo,
+				Category: types.CategoryTLS,
+				Resource: ref,
+				Summary:  fmt.Sprintf("trafficPolicy.tls.mode=%s", tlsMode),
+			})
+		}
+
+		// Surface connection pool settings (Story 3.3)
+		findings = append(findings, extractCircuitBreakerFindings(resource.Object, "spec", ref)...)
+
+		// Per-subset trafficPolicy circuit breakers
+		subsets, _, _ := unstructured.NestedSlice(resource.Object, "spec", "subsets")
+		for _, s := range subsets {
+			sm, ok := s.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			subsetName, _ := sm["name"].(string)
+			subsetRef := &types.ResourceRef{
+				Kind:       kind,
+				Namespace:  ns,
+				Name:       fmt.Sprintf("%s (subset: %s)", name, subsetName),
+				APIVersion: ref.APIVersion,
+			}
+			findings = append(findings, extractCircuitBreakerFindings(sm, "", subsetRef)...)
 		}
 	}
 
@@ -1915,4 +1950,138 @@ func isUnconstrainedRule(rule map[string]interface{}) bool {
 	}
 
 	return fromEmpty && toEmpty && whenEmpty
+}
+
+// extractCircuitBreakerFindings extracts connectionPool and outlierDetection settings
+// from a trafficPolicy block. The basePath should be "spec" for top-level or "" for subsets.
+func extractCircuitBreakerFindings(obj map[string]interface{}, basePath string, ref *types.ResourceRef) []types.DiagnosticFinding {
+	var findings []types.DiagnosticFinding
+
+	// Determine the trafficPolicy path
+	var tp map[string]interface{}
+	var found bool
+	if basePath != "" {
+		tp, found, _ = unstructured.NestedMap(obj, basePath, "trafficPolicy")
+	} else {
+		tp, found, _ = unstructured.NestedMap(obj, "trafficPolicy")
+	}
+	if !found || tp == nil {
+		return nil
+	}
+
+	// Connection pool (circuit breaker) settings
+	connPool, cpFound, _ := unstructured.NestedMap(tp, "connectionPool")
+	if cpFound && connPool != nil {
+		var cpParts []string
+
+		// TCP settings
+		tcpMaxConn, tcpOk, _ := unstructured.NestedFloat64(connPool, "tcp", "maxConnections")
+		if tcpOk {
+			cpParts = append(cpParts, fmt.Sprintf("tcp.maxConnections=%d", int(tcpMaxConn)))
+		}
+		tcpConnTimeout, _, _ := unstructured.NestedString(connPool, "tcp", "connectTimeout")
+		if tcpConnTimeout != "" {
+			cpParts = append(cpParts, fmt.Sprintf("tcp.connectTimeout=%s", tcpConnTimeout))
+		}
+
+		// HTTP settings
+		h1MaxPending, h1Ok, _ := unstructured.NestedFloat64(connPool, "http", "http1MaxPendingRequests")
+		if h1Ok {
+			cpParts = append(cpParts, fmt.Sprintf("http.http1MaxPendingRequests=%d", int(h1MaxPending)))
+		}
+		h2MaxReqs, h2Ok, _ := unstructured.NestedFloat64(connPool, "http", "http2MaxRequests")
+		if h2Ok {
+			cpParts = append(cpParts, fmt.Sprintf("http.http2MaxRequests=%d", int(h2MaxReqs)))
+		}
+		maxReqsPerConn, mrOk, _ := unstructured.NestedFloat64(connPool, "http", "maxRequestsPerConnection")
+		if mrOk {
+			cpParts = append(cpParts, fmt.Sprintf("http.maxRequestsPerConnection=%d", int(maxReqsPerConn)))
+		}
+		maxRetries, retOk, _ := unstructured.NestedFloat64(connPool, "http", "maxRetries")
+		if retOk {
+			cpParts = append(cpParts, fmt.Sprintf("http.maxRetries=%d", int(maxRetries)))
+		}
+
+		if len(cpParts) > 0 {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity: types.SeverityInfo,
+				Category: types.CategoryMesh,
+				Resource: ref,
+				Summary:  fmt.Sprintf("connectionPool: %s", strings.Join(cpParts, ", ")),
+			})
+		}
+	}
+
+	// Outlier detection settings
+	od, odFound, _ := unstructured.NestedMap(tp, "outlierDetection")
+	if odFound && od != nil {
+		var odParts []string
+
+		consecutive5xx, c5Ok, _ := unstructured.NestedFloat64(od, "consecutive5xxErrors")
+		if c5Ok {
+			odParts = append(odParts, fmt.Sprintf("consecutive5xxErrors=%d", int(consecutive5xx)))
+		}
+		consecutiveErrors, ceOk, _ := unstructured.NestedFloat64(od, "consecutiveErrors")
+		if ceOk {
+			odParts = append(odParts, fmt.Sprintf("consecutiveErrors=%d", int(consecutiveErrors)))
+		}
+		consecutiveGW, cgOk, _ := unstructured.NestedFloat64(od, "consecutiveGatewayErrors")
+		if cgOk {
+			odParts = append(odParts, fmt.Sprintf("consecutiveGatewayErrors=%d", int(consecutiveGW)))
+		}
+		interval, _, _ := unstructured.NestedString(od, "interval")
+		if interval != "" {
+			odParts = append(odParts, fmt.Sprintf("interval=%s", interval))
+		}
+		baseEjection, _, _ := unstructured.NestedString(od, "baseEjectionTime")
+		if baseEjection != "" {
+			odParts = append(odParts, fmt.Sprintf("baseEjectionTime=%s", baseEjection))
+		}
+		maxEjection, meOk, _ := unstructured.NestedFloat64(od, "maxEjectionPercent")
+		if meOk {
+			odParts = append(odParts, fmt.Sprintf("maxEjectionPercent=%d%%", int(maxEjection)))
+		}
+
+		if len(odParts) > 0 {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity: types.SeverityInfo,
+				Category: types.CategoryMesh,
+				Resource: ref,
+				Summary:  fmt.Sprintf("outlierDetection: %s", strings.Join(odParts, ", ")),
+			})
+		}
+
+		// Warn on aggressive settings
+		if ceOk && consecutiveErrors < 3 {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity:   types.SeverityWarning,
+				Category:   types.CategoryMesh,
+				Resource:   ref,
+				Summary:    fmt.Sprintf("outlierDetection.consecutiveErrors=%d is aggressive (< 3)", int(consecutiveErrors)),
+				Suggestion: "Consider increasing consecutiveErrors to reduce false ejections",
+			})
+		}
+		if c5Ok && consecutive5xx < 3 {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity:   types.SeverityWarning,
+				Category:   types.CategoryMesh,
+				Resource:   ref,
+				Summary:    fmt.Sprintf("outlierDetection.consecutive5xxErrors=%d is aggressive (< 3)", int(consecutive5xx)),
+				Suggestion: "Consider increasing consecutive5xxErrors to reduce false ejections",
+			})
+		}
+		if baseEjection != "" {
+			if dur, err := time.ParseDuration(baseEjection); err == nil && dur > 5*time.Minute {
+				findings = append(findings, types.DiagnosticFinding{
+					Severity:   types.SeverityWarning,
+					Category:   types.CategoryMesh,
+					Resource:   ref,
+					Summary:    fmt.Sprintf("outlierDetection.baseEjectionTime=%s is long (> 5m)", baseEjection),
+					Suggestion: "Long ejection times can cause extended service unavailability; consider reducing",
+				})
+			}
+		}
+	}
+
+	return findings
 }

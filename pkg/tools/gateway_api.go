@@ -372,7 +372,7 @@ func (t *ListGatewaysTool) Run(ctx context.Context, args map[string]interface{})
 								cType, _ := cm["type"].(string)
 								cReason, _ := cm["reason"].(string)
 								if cStatus == "False" && (cType == "Accepted" || cType == "Programmed" || cType == "Ready" || cType == "ResolvedRefs") {
-									part += fmt.Sprintf(" ⚠%s(%s)", cType, cReason)
+									part += fmt.Sprintf(" ⚠ %s=False(%s)", cType, cReason)
 								}
 							}
 						}
@@ -517,6 +517,81 @@ func (t *GetGatewayTool) Run(ctx context.Context, args map[string]interface{}) (
 		lSummary := fmt.Sprintf("Listener %s port=%s protocol=%s attachedRoutes=%d", lName, port, protocol, attached)
 		if hostname != "" {
 			lSummary += fmt.Sprintf(" hostname=%s", hostname)
+		}
+
+		// TLS configuration enrichment for HTTPS/TLS listeners
+		if protocol == "HTTPS" || protocol == "TLS" {
+			tlsConfig, tlsFound, _ := unstructured.NestedMap(lm, "tls")
+			if tlsFound && tlsConfig != nil {
+				tlsMode, _ := tlsConfig["mode"].(string)
+				if tlsMode == "" {
+					tlsMode = "Terminate" // default per Gateway API spec
+				}
+				lSummary += fmt.Sprintf(" tls=%s", tlsMode)
+
+				certRefs, _, _ := unstructured.NestedSlice(tlsConfig, "certificateRefs")
+				if len(certRefs) > 0 {
+					var certNames []string
+					for _, cr := range certRefs {
+						if crm, ok := cr.(map[string]interface{}); ok {
+							certName, _ := crm["name"].(string)
+							certNs, _ := crm["namespace"].(string)
+							if certNs == "" {
+								certNs = ns
+							}
+							certNames = append(certNames, certName)
+							// Verify secret exists (graceful RBAC handling)
+							_, secErr := t.Clients.Clientset.CoreV1().Secrets(certNs).Get(ctx, certName, metav1.GetOptions{})
+							if secErr != nil {
+								if strings.Contains(secErr.Error(), "forbidden") || strings.Contains(secErr.Error(), "Forbidden") {
+									findings = append(findings, types.DiagnosticFinding{
+										Severity: types.SeverityInfo,
+										Category: types.CategoryTLS,
+										Resource: gwRef,
+										Summary:  fmt.Sprintf("Listener %s: cannot verify cert Secret %s/%s (no read access)", lName, certNs, certName),
+									})
+								} else {
+									findings = append(findings, types.DiagnosticFinding{
+										Severity:   types.SeverityWarning,
+										Category:   types.CategoryTLS,
+										Resource:   gwRef,
+										Summary:    fmt.Sprintf("Listener %s: certificateRef Secret %s/%s not found", lName, certNs, certName),
+										Suggestion: fmt.Sprintf("Create Secret %s/%s with TLS certificate data", certNs, certName),
+									})
+								}
+							}
+						}
+					}
+					lSummary += fmt.Sprintf(" certs=[%s]", strings.Join(certNames, ", "))
+				} else if tlsMode == "Terminate" || tlsMode == "" {
+					findings = append(findings, types.DiagnosticFinding{
+						Severity:   types.SeverityWarning,
+						Category:   types.CategoryTLS,
+						Resource:   gwRef,
+						Summary:    fmt.Sprintf("Listener %s: HTTPS/TLS with mode=%s but no certificateRefs", lName, tlsMode),
+						Suggestion: "Add certificateRefs pointing to a TLS Secret",
+					})
+				}
+
+				// Contradictory config: Passthrough mode with certificateRefs
+				if tlsMode == "Passthrough" && len(certRefs) > 0 {
+					findings = append(findings, types.DiagnosticFinding{
+						Severity:   types.SeverityWarning,
+						Category:   types.CategoryTLS,
+						Resource:   gwRef,
+						Summary:    fmt.Sprintf("Listener %s: TLS mode=Passthrough but certificateRefs are set (contradiction)", lName),
+						Suggestion: "Remove certificateRefs for Passthrough mode, or change mode to Terminate",
+					})
+				}
+			} else {
+				findings = append(findings, types.DiagnosticFinding{
+					Severity:   types.SeverityWarning,
+					Category:   types.CategoryTLS,
+					Resource:   gwRef,
+					Summary:    fmt.Sprintf("Listener %s: %s protocol but no TLS configuration", lName, protocol),
+					Suggestion: "Add tls configuration with mode and certificateRefs",
+				})
+			}
 		}
 
 		severity := types.SeverityInfo
@@ -766,10 +841,6 @@ func (t *GetHTTPRouteTool) Run(ctx context.Context, args map[string]interface{})
 		return nil, fmt.Errorf("failed to get httproute %s/%s: %w", ns, name, err)
 	}
 
-	// Fetch ReferenceGrants for cross-namespace validation
-	refGrantList, _ := listWithFallback(ctx, t.Clients.Dynamic, refGrantsV1GVR, refGrantsV1B1GVR, "")
-	refGrants := buildRefGrants(refGrantList)
-
 	routeRef := &types.ResourceRef{
 		Kind:       "HTTPRoute",
 		Namespace:  ns,
@@ -779,6 +850,9 @@ func (t *GetHTTPRouteTool) Run(ctx context.Context, args map[string]interface{})
 
 	parentRefs, _, _ := unstructured.NestedSlice(route.Object, "spec", "parentRefs")
 	rules, _, _ := unstructured.NestedSlice(route.Object, "spec", "rules")
+
+	// Collect cross-namespace backend namespaces, then fetch ReferenceGrants only from those
+	refGrants := fetchScopedRefGrants(ctx, t.Clients.Dynamic, ns, rules)
 
 	var findings []types.DiagnosticFinding
 
@@ -878,14 +952,17 @@ func (t *GetHTTPRouteTool) Run(ctx context.Context, args map[string]interface{})
 		})
 	}
 
-	// Check backend service health
-	for _, r := range rules {
+	// Consolidated backend validation: health, weights, timeouts, cross-ns refs
+	endpointHealth := make(map[string]backendEndpointHealth)
+	for i, r := range rules {
 		rm, ok := r.(map[string]interface{})
 		if !ok {
 			continue
 		}
 		brs, ok := rm["backendRefs"].([]interface{})
 		if !ok {
+			// Still check timeouts even if no backendRefs
+			findings = append(findings, checkRuleTimeouts(rm, i, routeRef)...)
 			continue
 		}
 		for _, br := range brs {
@@ -898,50 +975,64 @@ func (t *GetHTTPRouteTool) Run(ctx context.Context, args map[string]interface{})
 			if rns, ok := brm["namespace"].(string); ok && rns != "" {
 				refNs = rns
 			}
+			key := refNs + "/" + refName
 
-			_, svcErr := t.Clients.Dynamic.Resource(servicesGVR).Namespace(refNs).Get(ctx, refName, metav1.GetOptions{})
-			if svcErr != nil {
-				findings = append(findings, types.DiagnosticFinding{
-					Severity:   types.SeverityWarning,
-					Category:   types.CategoryRouting,
-					Resource:   routeRef,
-					Summary:    fmt.Sprintf("Backend service %s/%s not found", refNs, refName),
-					Detail:     svcErr.Error(),
-					Suggestion: "Verify the backend service name and namespace are correct",
-				})
-				continue
-			}
+			// Backend health check (deduplicated across rules)
+			if _, checked := endpointHealth[key]; !checked {
+				_, svcErr := t.Clients.Dynamic.Resource(servicesGVR).Namespace(refNs).Get(ctx, refName, metav1.GetOptions{})
+				if svcErr != nil {
+					findings = append(findings, types.DiagnosticFinding{
+						Severity:   types.SeverityWarning,
+						Category:   types.CategoryRouting,
+						Resource:   routeRef,
+						Summary:    fmt.Sprintf("Backend service %s/%s not found", refNs, refName),
+						Detail:     svcErr.Error(),
+						Suggestion: "Verify the backend service name and namespace are correct",
+					})
+					endpointHealth[key] = backendEndpointHealth{readyCount: 0, found: false}
+					continue
+				}
 
-			ep, epErr := t.Clients.Dynamic.Resource(endpointsGVR).Namespace(refNs).Get(ctx, refName, metav1.GetOptions{})
-			if epErr != nil {
-				continue
-			}
-			subsets, _, _ := unstructured.NestedSlice(ep.Object, "subsets")
-			readyCount := 0
-			for _, s := range subsets {
-				if sm, ok := s.(map[string]interface{}); ok {
-					if addrs, ok := sm["addresses"].([]interface{}); ok {
-						readyCount += len(addrs)
+				readyCount := 0
+				ep, epErr := t.Clients.Dynamic.Resource(endpointsGVR).Namespace(refNs).Get(ctx, refName, metav1.GetOptions{})
+				if epErr == nil {
+					subsets, _, _ := unstructured.NestedSlice(ep.Object, "subsets")
+					for _, s := range subsets {
+						if sm, ok := s.(map[string]interface{}); ok {
+							if addrs, ok := sm["addresses"].([]interface{}); ok {
+								readyCount += len(addrs)
+							}
+						}
 					}
 				}
+				endpointHealth[key] = backendEndpointHealth{readyCount: readyCount, found: true}
+				if readyCount == 0 {
+					findings = append(findings, types.DiagnosticFinding{
+						Severity:   types.SeverityWarning,
+						Category:   types.CategoryRouting,
+						Resource:   routeRef,
+						Summary:    fmt.Sprintf("Backend service %s/%s has 0 ready endpoints", refNs, refName),
+						Suggestion: "Check that pods backing this service are running and passing readiness probes",
+					})
+				} else {
+					findings = append(findings, types.DiagnosticFinding{
+						Severity: types.SeverityOK,
+						Category: types.CategoryRouting,
+						Resource: routeRef,
+						Summary:  fmt.Sprintf("Backend service %s/%s has %d ready endpoints", refNs, refName, readyCount),
+					})
+				}
 			}
-			if readyCount == 0 {
-				findings = append(findings, types.DiagnosticFinding{
-					Severity:   types.SeverityWarning,
-					Category:   types.CategoryRouting,
-					Resource:   routeRef,
-					Summary:    fmt.Sprintf("Backend service %s/%s has 0 ready endpoints", refNs, refName),
-					Suggestion: "Check that pods backing this service are running and passing readiness probes",
-				})
-			} else {
-				findings = append(findings, types.DiagnosticFinding{
-					Severity: types.SeverityOK,
-					Category: types.CategoryRouting,
-					Resource: routeRef,
-					Summary:  fmt.Sprintf("Backend service %s/%s has %d ready endpoints", refNs, refName, readyCount),
-				})
+
+			// Cross-namespace reference validation
+			if finding := validateCrossNamespaceRef(ns, "HTTPRoute", refNs, refName, refGrants, routeRef); finding != nil {
+				findings = append(findings, *finding)
 			}
 		}
+
+		// Weight and timeout validation (uses pre-fetched endpoint health)
+		findings = append(findings, checkRuleWeights(rm, ns, i, routeRef, endpointHealth)...)
+		findings = append(findings, checkRuleTimeouts(rm, i, routeRef)...)
 	}
 
 	// Route status conditions (from parent statuses)
@@ -977,42 +1068,6 @@ func (t *GetHTTPRouteTool) Run(ctx context.Context, args map[string]interface{})
 						Suggestion: "Check that the parent gateway and listener accept this route",
 					})
 				}
-			}
-		}
-	}
-
-	// Weight distribution and timeout validation per rule
-	for i, r := range rules {
-		rm, ok := r.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		findings = append(findings, checkRuleWeights(ctx, t.Clients.Dynamic, rm, ns, i, routeRef)...)
-		findings = append(findings, checkRuleTimeouts(rm, i, routeRef)...)
-	}
-
-	// Cross-namespace reference validation
-	for _, r := range rules {
-		rm, ok := r.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		brs, ok := rm["backendRefs"].([]interface{})
-		if !ok {
-			continue
-		}
-		for _, br := range brs {
-			brm, ok := br.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			refName, _ := brm["name"].(string)
-			refNs := ns
-			if rns, ok := brm["namespace"].(string); ok && rns != "" {
-				refNs = rns
-			}
-			if finding := validateCrossNamespaceRef(ns, "HTTPRoute", refNs, refName, refGrants, routeRef); finding != nil {
-				findings = append(findings, *finding)
 			}
 		}
 	}
@@ -1172,10 +1227,6 @@ func (t *GetGRPCRouteTool) Run(ctx context.Context, args map[string]interface{})
 		return nil, fmt.Errorf("failed to get grpcroute %s/%s: %w", ns, name, err)
 	}
 
-	// Fetch ReferenceGrants for cross-namespace validation
-	refGrantList, _ := listWithFallback(ctx, t.Clients.Dynamic, refGrantsV1GVR, refGrantsV1B1GVR, "")
-	refGrants := buildRefGrants(refGrantList)
-
 	routeRef := &types.ResourceRef{
 		Kind:       "GRPCRoute",
 		Namespace:  ns,
@@ -1185,6 +1236,9 @@ func (t *GetGRPCRouteTool) Run(ctx context.Context, args map[string]interface{})
 
 	parentRefs, _, _ := unstructured.NestedSlice(route.Object, "spec", "parentRefs")
 	rules, _, _ := unstructured.NestedSlice(route.Object, "spec", "rules")
+
+	// Collect cross-namespace backend namespaces, then fetch ReferenceGrants only from those
+	refGrants := fetchScopedRefGrants(ctx, t.Clients.Dynamic, ns, rules)
 
 	var findings []types.DiagnosticFinding
 
@@ -1285,8 +1339,9 @@ func (t *GetGRPCRouteTool) Run(ctx context.Context, args map[string]interface{})
 		})
 	}
 
-	// Check backend service health
-	for _, r := range rules {
+	// Consolidated backend validation: health, weights, cross-ns refs
+	endpointHealth := make(map[string]backendEndpointHealth)
+	for i, r := range rules {
 		rm, ok := r.(map[string]interface{})
 		if !ok {
 			continue
@@ -1305,50 +1360,63 @@ func (t *GetGRPCRouteTool) Run(ctx context.Context, args map[string]interface{})
 			if rns, ok := brm["namespace"].(string); ok && rns != "" {
 				refNs = rns
 			}
+			key := refNs + "/" + refName
 
-			_, svcErr := t.Clients.Dynamic.Resource(servicesGVR).Namespace(refNs).Get(ctx, refName, metav1.GetOptions{})
-			if svcErr != nil {
-				findings = append(findings, types.DiagnosticFinding{
-					Severity:   types.SeverityWarning,
-					Category:   types.CategoryRouting,
-					Resource:   routeRef,
-					Summary:    fmt.Sprintf("Backend service %s/%s not found", refNs, refName),
-					Detail:     svcErr.Error(),
-					Suggestion: "Verify the backend service name and namespace are correct",
-				})
-				continue
-			}
+			// Backend health check (deduplicated across rules)
+			if _, checked := endpointHealth[key]; !checked {
+				_, svcErr := t.Clients.Dynamic.Resource(servicesGVR).Namespace(refNs).Get(ctx, refName, metav1.GetOptions{})
+				if svcErr != nil {
+					findings = append(findings, types.DiagnosticFinding{
+						Severity:   types.SeverityWarning,
+						Category:   types.CategoryRouting,
+						Resource:   routeRef,
+						Summary:    fmt.Sprintf("Backend service %s/%s not found", refNs, refName),
+						Detail:     svcErr.Error(),
+						Suggestion: "Verify the backend service name and namespace are correct",
+					})
+					endpointHealth[key] = backendEndpointHealth{readyCount: 0, found: false}
+					continue
+				}
 
-			ep, epErr := t.Clients.Dynamic.Resource(endpointsGVR).Namespace(refNs).Get(ctx, refName, metav1.GetOptions{})
-			if epErr != nil {
-				continue
-			}
-			subsets, _, _ := unstructured.NestedSlice(ep.Object, "subsets")
-			readyCount := 0
-			for _, s := range subsets {
-				if sm, ok := s.(map[string]interface{}); ok {
-					if addrs, ok := sm["addresses"].([]interface{}); ok {
-						readyCount += len(addrs)
+				readyCount := 0
+				ep, epErr := t.Clients.Dynamic.Resource(endpointsGVR).Namespace(refNs).Get(ctx, refName, metav1.GetOptions{})
+				if epErr == nil {
+					subsets, _, _ := unstructured.NestedSlice(ep.Object, "subsets")
+					for _, s := range subsets {
+						if sm, ok := s.(map[string]interface{}); ok {
+							if addrs, ok := sm["addresses"].([]interface{}); ok {
+								readyCount += len(addrs)
+							}
+						}
 					}
 				}
+				endpointHealth[key] = backendEndpointHealth{readyCount: readyCount, found: true}
+				if readyCount == 0 {
+					findings = append(findings, types.DiagnosticFinding{
+						Severity:   types.SeverityWarning,
+						Category:   types.CategoryRouting,
+						Resource:   routeRef,
+						Summary:    fmt.Sprintf("Backend service %s/%s has 0 ready endpoints", refNs, refName),
+						Suggestion: "Check that pods backing this service are running and passing readiness probes",
+					})
+				} else {
+					findings = append(findings, types.DiagnosticFinding{
+						Severity: types.SeverityOK,
+						Category: types.CategoryRouting,
+						Resource: routeRef,
+						Summary:  fmt.Sprintf("Backend service %s/%s has %d ready endpoints", refNs, refName, readyCount),
+					})
+				}
 			}
-			if readyCount == 0 {
-				findings = append(findings, types.DiagnosticFinding{
-					Severity:   types.SeverityWarning,
-					Category:   types.CategoryRouting,
-					Resource:   routeRef,
-					Summary:    fmt.Sprintf("Backend service %s/%s has 0 ready endpoints", refNs, refName),
-					Suggestion: "Check that pods backing this service are running and passing readiness probes",
-				})
-			} else {
-				findings = append(findings, types.DiagnosticFinding{
-					Severity: types.SeverityOK,
-					Category: types.CategoryRouting,
-					Resource: routeRef,
-					Summary:  fmt.Sprintf("Backend service %s/%s has %d ready endpoints", refNs, refName, readyCount),
-				})
+
+			// Cross-namespace reference validation
+			if finding := validateCrossNamespaceRef(ns, "GRPCRoute", refNs, refName, refGrants, routeRef); finding != nil {
+				findings = append(findings, *finding)
 			}
 		}
+
+		// Weight validation (uses pre-fetched endpoint health)
+		findings = append(findings, checkRuleWeights(rm, ns, i, routeRef, endpointHealth)...)
 	}
 
 	// Route status conditions (from parent statuses)
@@ -1384,41 +1452,6 @@ func (t *GetGRPCRouteTool) Run(ctx context.Context, args map[string]interface{})
 						Suggestion: "Check that the parent gateway and listener accept this GRPCRoute",
 					})
 				}
-			}
-		}
-	}
-
-	// Weight distribution validation per rule
-	for i, r := range rules {
-		rm, ok := r.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		findings = append(findings, checkRuleWeights(ctx, t.Clients.Dynamic, rm, ns, i, routeRef)...)
-	}
-
-	// Cross-namespace reference validation
-	for _, r := range rules {
-		rm, ok := r.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		brs, ok := rm["backendRefs"].([]interface{})
-		if !ok {
-			continue
-		}
-		for _, br := range brs {
-			brm, ok := br.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			refName, _ := brm["name"].(string)
-			refNs := ns
-			if rns, ok := brm["namespace"].(string); ok && rns != "" {
-				refNs = rns
-			}
-			if finding := validateCrossNamespaceRef(ns, "GRPCRoute", refNs, refName, refGrants, routeRef); finding != nil {
-				findings = append(findings, *finding)
 			}
 		}
 	}
@@ -2638,7 +2671,13 @@ func hasUnhealthyCondition(conditions []interface{}) bool {
 
 // checkRuleWeights validates weight distribution across backendRefs in a route rule.
 // Returns warnings when weights don't sum to 100 or when weighted backends have 0 endpoints.
-func checkRuleWeights(ctx context.Context, dynClient dynamic.Interface, rm map[string]interface{}, ns string, ruleIdx int, routeRef *types.ResourceRef) []types.DiagnosticFinding {
+// backendEndpointHealth holds pre-fetched endpoint readiness for a backend.
+type backendEndpointHealth struct {
+	readyCount int
+	found      bool
+}
+
+func checkRuleWeights(rm map[string]interface{}, ns string, ruleIdx int, routeRef *types.ResourceRef, endpointHealth map[string]backendEndpointHealth) []types.DiagnosticFinding {
 	brs, ok := rm["backendRefs"].([]interface{})
 	if !ok || len(brs) < 2 {
 		return nil // Weight validation only meaningful with multiple backends
@@ -2667,6 +2706,10 @@ func checkRuleWeights(ctx context.Context, dynClient dynamic.Interface, rm map[s
 			hasExplicitWeight = true
 			totalWeight += int(w)
 			weightedBackends = append(weightedBackends, weightedBackend{name: brName, ns: brNs, weight: int(w)})
+		} else {
+			// Per Gateway API spec, default weight is 1 when not specified
+			totalWeight += 1
+			weightedBackends = append(weightedBackends, weightedBackend{name: brName, ns: brNs, weight: 1})
 		}
 	}
 
@@ -2687,25 +2730,13 @@ func checkRuleWeights(ctx context.Context, dynClient dynamic.Interface, rm map[s
 		})
 	}
 
-	// Check weighted backends with 0 ready endpoints
+	// Check weighted backends with 0 ready endpoints (using pre-fetched data)
 	for _, wb := range weightedBackends {
 		if wb.weight == 0 {
 			continue
 		}
-		ep, err := dynClient.Resource(endpointsGVR).Namespace(wb.ns).Get(ctx, wb.name, metav1.GetOptions{})
-		if err != nil {
-			continue
-		}
-		subsets, _, _ := unstructured.NestedSlice(ep.Object, "subsets")
-		readyCount := 0
-		for _, s := range subsets {
-			if sm, ok := s.(map[string]interface{}); ok {
-				if addrs, ok := sm["addresses"].([]interface{}); ok {
-					readyCount += len(addrs)
-				}
-			}
-		}
-		if readyCount == 0 {
+		key := wb.ns + "/" + wb.name
+		if eh, ok := endpointHealth[key]; ok && eh.found && eh.readyCount == 0 {
 			findings = append(findings, types.DiagnosticFinding{
 				Severity:   types.SeverityWarning,
 				Category:   types.CategoryRouting,
@@ -2757,13 +2788,16 @@ func checkRuleTimeouts(rm map[string]interface{}, ruleIdx int, routeRef *types.R
 		}
 	}
 
-	findings = append(findings, types.DiagnosticFinding{
-		Severity:   severity,
-		Category:   types.CategoryRouting,
-		Resource:   routeRef,
-		Summary:    fmt.Sprintf("Rule %d: %s", ruleIdx, strings.Join(parts, ", ")),
-		Suggestion: suggestion,
-	})
+	finding := types.DiagnosticFinding{
+		Severity: severity,
+		Category: types.CategoryRouting,
+		Resource: routeRef,
+		Summary:  fmt.Sprintf("Rule %d: %s", ruleIdx, strings.Join(parts, ", ")),
+	}
+	if suggestion != "" {
+		finding.Suggestion = suggestion
+	}
+	findings = append(findings, finding)
 
 	return findings
 }
@@ -2773,6 +2807,41 @@ type refGrantEntry struct {
 	fromNs   string
 	fromKind string
 	toNs     string
+}
+
+// fetchScopedRefGrants collects cross-namespace backend namespaces from rules,
+// then fetches ReferenceGrants only from those target namespaces.
+// Returns nil if no cross-namespace refs exist (avoids unnecessary API calls).
+func fetchScopedRefGrants(ctx context.Context, dynClient dynamic.Interface, routeNs string, rules []interface{}) []refGrantEntry {
+	targetNamespaces := make(map[string]bool)
+	for _, r := range rules {
+		rm, ok := r.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		brs, ok := rm["backendRefs"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, br := range brs {
+			brm, ok := br.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if rns, ok := brm["namespace"].(string); ok && rns != "" && rns != routeNs {
+				targetNamespaces[rns] = true
+			}
+		}
+	}
+	if len(targetNamespaces) == 0 {
+		return nil
+	}
+	var allGrants []refGrantEntry
+	for targetNs := range targetNamespaces {
+		refGrantList, _ := listWithFallback(ctx, dynClient, refGrantsV1GVR, refGrantsV1B1GVR, targetNs)
+		allGrants = append(allGrants, buildRefGrants(refGrantList)...)
+	}
+	return allGrants
 }
 
 // buildRefGrants extracts refGrantEntry list from a ReferenceGrant list.
@@ -2869,9 +2938,17 @@ func extractRouteStatusSuffix(obj map[string]interface{}) (string, bool) {
 
 			switch condType {
 			case "Accepted":
-				problems = append(problems, fmt.Sprintf("⚠ NOT_ACCEPTED(%s) via %s", reason, controller))
+				if controller != "" {
+					problems = append(problems, fmt.Sprintf("⚠ NOT_ACCEPTED(%s) via %s", reason, controller))
+				} else {
+					problems = append(problems, fmt.Sprintf("⚠ NOT_ACCEPTED(%s)", reason))
+				}
 			case "ResolvedRefs":
-				problems = append(problems, fmt.Sprintf("⚠ UNRESOLVED_REFS(%s) via %s", reason, controller))
+				if controller != "" {
+					problems = append(problems, fmt.Sprintf("⚠ UNRESOLVED_REFS(%s) via %s", reason, controller))
+				} else {
+					problems = append(problems, fmt.Sprintf("⚠ UNRESOLVED_REFS(%s)", reason))
+				}
 			}
 		}
 	}
@@ -2890,7 +2967,7 @@ func fetchRecentEvents(ctx context.Context, clientset kubernetes.Interface, ns, 
 	}
 
 	oneHourAgo := time.Now().Add(-1 * time.Hour)
-	fieldSelector := fmt.Sprintf("involvedObject.name=%s,involvedObject.kind=%s", name, kind)
+	fieldSelector := fmt.Sprintf("involvedObject.name=%s,involvedObject.kind=%s,involvedObject.namespace=%s", name, kind, ns)
 	events, err := clientset.CoreV1().Events(ns).List(ctx, metav1.ListOptions{
 		FieldSelector: fieldSelector,
 	})

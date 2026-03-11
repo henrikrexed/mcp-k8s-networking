@@ -86,8 +86,9 @@ func main() {
 	// Create MCP server
 	srv := mcpserver.NewServer(registry)
 
-	// Register remediation tool (always available)
+	// Register remediation and rate limit tools (always available — graceful CRD handling)
 	registry.Register(&tools.SuggestRemediationTool{BaseTool: base})
+	registry.Register(&tools.CheckRateLimitPoliciesTool{BaseTool: base})
 
 	// Gateway API tool names for conditional registration
 	gatewayToolNames := []string{"list_gateways", "get_gateway", "list_httproutes", "get_httproute", "list_grpcroutes", "get_grpcroute", "list_referencegrants", "get_referencegrant", "scan_gateway_misconfigs", "check_gateway_conformance", "design_gateway_api"}
