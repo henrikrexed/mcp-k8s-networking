@@ -1955,8 +1955,6 @@ func isUnconstrainedRule(rule map[string]interface{}) bool {
 // extractCircuitBreakerFindings extracts connectionPool and outlierDetection settings
 // from a trafficPolicy block. The basePath should be "spec" for top-level or "" for subsets.
 func extractCircuitBreakerFindings(obj map[string]interface{}, basePath string, ref *types.ResourceRef) []types.DiagnosticFinding {
-	var findings []types.DiagnosticFinding
-
 	// Determine the trafficPolicy path
 	var tp map[string]interface{}
 	var found bool
@@ -1969,8 +1967,16 @@ func extractCircuitBreakerFindings(obj map[string]interface{}, basePath string, 
 		return nil
 	}
 
+	return extractCBFromMap(tp, ref)
+}
+
+// extractCBFromMap extracts connectionPool and outlierDetection findings from a map
+// that directly contains these fields (e.g. Istio trafficPolicy or kgateway spec).
+func extractCBFromMap(parent map[string]interface{}, ref *types.ResourceRef) []types.DiagnosticFinding {
+	var findings []types.DiagnosticFinding
+
 	// Connection pool (circuit breaker) settings
-	connPool, cpFound, _ := unstructured.NestedMap(tp, "connectionPool")
+	connPool, cpFound, _ := unstructured.NestedMap(parent, "connectionPool")
 	if cpFound && connPool != nil {
 		var cpParts []string
 
@@ -2013,7 +2019,7 @@ func extractCircuitBreakerFindings(obj map[string]interface{}, basePath string, 
 	}
 
 	// Outlier detection settings
-	od, odFound, _ := unstructured.NestedMap(tp, "outlierDetection")
+	od, odFound, _ := unstructured.NestedMap(parent, "outlierDetection")
 	if odFound && od != nil {
 		var odParts []string
 

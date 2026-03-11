@@ -584,12 +584,13 @@ func (t *GetGatewayTool) Run(ctx context.Context, args map[string]interface{}) (
 					})
 				}
 			} else {
+				// No TLS block — some controllers auto-provision certs, so use info not warning
 				findings = append(findings, types.DiagnosticFinding{
-					Severity:   types.SeverityWarning,
+					Severity:   types.SeverityInfo,
 					Category:   types.CategoryTLS,
 					Resource:   gwRef,
-					Summary:    fmt.Sprintf("Listener %s: %s protocol but no TLS configuration", lName, protocol),
-					Suggestion: "Add tls configuration with mode and certificateRefs",
+					Summary:    fmt.Sprintf("Listener %s: %s protocol but no explicit TLS configuration (may be auto-provisioned)", lName, protocol),
+					Suggestion: "If not using auto-cert provisioning, add tls configuration with mode and certificateRefs",
 				})
 			}
 		}

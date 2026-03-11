@@ -1129,6 +1129,7 @@ func isKgatewayManaged(gw *unstructured.Unstructured) bool {
 }
 
 // checkTrafficPolicies surfaces circuit breaker and rate limit settings from kgateway TrafficPolicy resources.
+// Uses extractCBFromMap (shared with Istio) for connectionPool/outlierDetection extraction.
 func (t *CheckKgatewayHealthTool) checkTrafficPolicies(ctx context.Context) []types.DiagnosticFinding {
 	list, err := t.Clients.Dynamic.Resource(trafficPolicyGVR).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -1146,65 +1147,12 @@ func (t *CheckKgatewayHealthTool) checkTrafficPolicies(ctx context.Context) []ty
 			APIVersion: "gateway.kgateway.dev/v1alpha1",
 		}
 
-		// Connection pool / circuit breaker
-		connPool, cpFound, _ := unstructured.NestedMap(tp.Object, "spec", "connectionPool")
-		if cpFound && connPool != nil {
-			var cpParts []string
-			if maxConn, ok, _ := unstructured.NestedFloat64(connPool, "tcp", "maxConnections"); ok {
-				cpParts = append(cpParts, fmt.Sprintf("tcp.maxConnections=%d", int(maxConn)))
-			}
-			if h1Max, ok, _ := unstructured.NestedFloat64(connPool, "http", "http1MaxPendingRequests"); ok {
-				cpParts = append(cpParts, fmt.Sprintf("http.http1MaxPendingRequests=%d", int(h1Max)))
-			}
-			if h2Max, ok, _ := unstructured.NestedFloat64(connPool, "http", "http2MaxRequests"); ok {
-				cpParts = append(cpParts, fmt.Sprintf("http.http2MaxRequests=%d", int(h2Max)))
-			}
-			if len(cpParts) > 0 {
-				findings = append(findings, types.DiagnosticFinding{
-					Severity: types.SeverityInfo,
-					Category: types.CategoryMesh,
-					Resource: ref,
-					Summary:  fmt.Sprintf("TrafficPolicy %s/%s connectionPool: %s", tpNs, tpName, strings.Join(cpParts, ", ")),
-				})
-			}
+		// kgateway TrafficPolicy has connectionPool and outlierDetection directly under spec
+		spec, specFound, _ := unstructured.NestedMap(tp.Object, "spec")
+		if !specFound || spec == nil {
+			continue
 		}
-
-		// Outlier detection
-		od, odFound, _ := unstructured.NestedMap(tp.Object, "spec", "outlierDetection")
-		if odFound && od != nil {
-			var odParts []string
-			if ce, ok, _ := unstructured.NestedFloat64(od, "consecutiveErrors"); ok {
-				odParts = append(odParts, fmt.Sprintf("consecutiveErrors=%d", int(ce)))
-			}
-			if interval, _, _ := unstructured.NestedString(od, "interval"); interval != "" {
-				odParts = append(odParts, fmt.Sprintf("interval=%s", interval))
-			}
-			if baseEject, _, _ := unstructured.NestedString(od, "baseEjectionTime"); baseEject != "" {
-				odParts = append(odParts, fmt.Sprintf("baseEjectionTime=%s", baseEject))
-			}
-			if maxEject, ok, _ := unstructured.NestedFloat64(od, "maxEjectionPercent"); ok {
-				odParts = append(odParts, fmt.Sprintf("maxEjectionPercent=%d%%", int(maxEject)))
-			}
-			if len(odParts) > 0 {
-				findings = append(findings, types.DiagnosticFinding{
-					Severity: types.SeverityInfo,
-					Category: types.CategoryMesh,
-					Resource: ref,
-					Summary:  fmt.Sprintf("TrafficPolicy %s/%s outlierDetection: %s", tpNs, tpName, strings.Join(odParts, ", ")),
-				})
-			}
-
-			// Warn on aggressive settings
-			if ce, ok, _ := unstructured.NestedFloat64(od, "consecutiveErrors"); ok && ce < 3 {
-				findings = append(findings, types.DiagnosticFinding{
-					Severity:   types.SeverityWarning,
-					Category:   types.CategoryMesh,
-					Resource:   ref,
-					Summary:    fmt.Sprintf("TrafficPolicy %s/%s outlierDetection.consecutiveErrors=%d is aggressive (< 3)", tpNs, tpName, int(ce)),
-					Suggestion: "Consider increasing consecutiveErrors to reduce false ejections",
-				})
-			}
-		}
+		findings = append(findings, extractCBFromMap(spec, ref)...)
 	}
 
 	return findings

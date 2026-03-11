@@ -60,6 +60,11 @@ func (t *CheckRateLimitPoliciesTool) Run(ctx context.Context, args map[string]in
 		}
 	}
 
+	responseNs := ns
+	if responseNs == "" {
+		responseNs = "all"
+	}
+
 	var findings []types.DiagnosticFinding
 
 	// 1. Check kgateway TrafficPolicy resources with rateLimit config
@@ -69,10 +74,6 @@ func (t *CheckRateLimitPoliciesTool) Run(ctx context.Context, args map[string]in
 	findings = append(findings, t.checkIstioEnvoyFilters(ctx, ns, service)...)
 
 	if len(findings) == 0 {
-		responseNs := ns
-		if responseNs == "" {
-			responseNs = "all"
-		}
 		findings = append(findings, types.DiagnosticFinding{
 			Severity: types.SeverityInfo,
 			Category: types.CategoryPolicy,
@@ -80,10 +81,6 @@ func (t *CheckRateLimitPoliciesTool) Run(ctx context.Context, args map[string]in
 		})
 	}
 
-	responseNs := ns
-	if responseNs == "" {
-		responseNs = "all"
-	}
 	return NewToolResultResponse(t.Cfg, t.Name(), findings, responseNs, "multi"), nil
 }
 
@@ -116,12 +113,12 @@ func (t *CheckRateLimitPoliciesTool) checkKgatewayTrafficPolicies(ctx context.Co
 		if targetRef != nil {
 			targetName, _ := targetRef["name"].(string)
 			targetKind, _ := targetRef["kind"].(string)
-			// Match on service name or route name
-			if targetName != "" && targetName != service && (route == "" || targetName != route) {
-				if targetKind != "Service" || targetName != service {
-					if targetKind != "HTTPRoute" || (route != "" && targetName != route) {
-						continue
-					}
+			if targetName != "" {
+				matches := targetName == service ||
+					(targetKind == "Service" && targetName == service) ||
+					(targetKind == "HTTPRoute" && (route == "" || targetName == route))
+				if !matches {
+					continue
 				}
 			}
 		}
@@ -193,6 +190,14 @@ func (t *CheckRateLimitPoliciesTool) checkKgatewayTrafficPolicies(ctx context.Co
 	return findings
 }
 
+// envoyRateLimitTypeURLs are the canonical Envoy typed_config @type URLs for rate limit filters.
+var envoyRateLimitTypeURLs = map[string]string{
+	"type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit":             "local",
+	"type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimit":                        "global",
+	"type.googleapis.com/udpa.type.v1.TypedStruct":                                                    "", // needs deeper inspection
+	"type.googleapis.com/envoy.extensions.filters.network.local_ratelimit.v3.LocalRateLimit":           "local",
+}
+
 func (t *CheckRateLimitPoliciesTool) checkIstioEnvoyFilters(ctx context.Context, ns, service string) []types.DiagnosticFinding {
 	var list *unstructured.UnstructuredList
 	var err error
@@ -204,6 +209,9 @@ func (t *CheckRateLimitPoliciesTool) checkIstioEnvoyFilters(ctx context.Context,
 	if err != nil {
 		return nil // CRD not installed or no access — silent
 	}
+
+	// Fetch the service's pod selector labels for workloadSelector matching
+	svcPodLabels := t.fetchServicePodLabels(ctx, ns, service)
 
 	var findings []types.DiagnosticFinding
 	for _, ef := range list.Items {
@@ -245,16 +253,13 @@ func (t *CheckRateLimitPoliciesTool) checkIstioEnvoyFilters(ctx context.Context,
 				rlFilterType = "global"
 			}
 
-			// Also check typed_config for rate limit
+			// Also check typed_config for rate limit (exact type URL matching)
 			typedConfig, _, _ := unstructured.NestedMap(value, "typed_config")
 			if typedConfig != nil {
 				typeURL, _ := typedConfig["@type"].(string)
-				if strings.Contains(typeURL, "local_rate_limit") {
+				if rlType, ok := envoyRateLimitTypeURLs[typeURL]; ok && rlType != "" {
 					hasRateLimit = true
-					rlFilterType = "local"
-				} else if strings.Contains(typeURL, "rate_limit") && !strings.Contains(typeURL, "local") {
-					hasRateLimit = true
-					rlFilterType = "global"
+					rlFilterType = rlType
 				}
 			}
 		}
@@ -265,6 +270,7 @@ func (t *CheckRateLimitPoliciesTool) checkIstioEnvoyFilters(ctx context.Context,
 
 		// Check workload selector for service relevance
 		scope := "all workloads"
+		matchesService := true // no selector → applies to all, including our service
 		workloadSelector, _, _ := unstructured.NestedMap(ef.Object, "spec", "workloadSelector")
 		if workloadSelector != nil {
 			labels, _, _ := unstructured.NestedStringMap(workloadSelector, "labels")
@@ -274,7 +280,17 @@ func (t *CheckRateLimitPoliciesTool) checkIstioEnvoyFilters(ctx context.Context,
 					labelParts = append(labelParts, fmt.Sprintf("%s=%s", k, v))
 				}
 				scope = fmt.Sprintf("workloads matching {%s}", strings.Join(labelParts, ", "))
+
+				// Filter: only include if workloadSelector labels match the service's pod labels
+				if len(svcPodLabels) > 0 {
+					matchesService = labelsMatch(labels, svcPodLabels)
+				}
+				// If we couldn't fetch service labels, include the filter (can't confirm/deny)
 			}
+		}
+
+		if !matchesService {
+			continue
 		}
 
 		findings = append(findings, types.DiagnosticFinding{
@@ -286,4 +302,28 @@ func (t *CheckRateLimitPoliciesTool) checkIstioEnvoyFilters(ctx context.Context,
 	}
 
 	return findings
+}
+
+// fetchServicePodLabels returns the pod selector labels for a service.
+// Returns nil if the service can't be fetched (graceful degradation).
+func (t *CheckRateLimitPoliciesTool) fetchServicePodLabels(ctx context.Context, ns, service string) map[string]string {
+	if ns == "" || service == "" {
+		return nil
+	}
+	svc, err := t.Clients.Dynamic.Resource(servicesGVR).Namespace(ns).Get(ctx, service, metav1.GetOptions{})
+	if err != nil {
+		return nil
+	}
+	selector, _, _ := unstructured.NestedStringMap(svc.Object, "spec", "selector")
+	return selector
+}
+
+// labelsMatch returns true if all selector labels are present in pod labels.
+func labelsMatch(selector, podLabels map[string]string) bool {
+	for k, v := range selector {
+		if podLabels[k] != v {
+			return false
+		}
+	}
+	return true
 }
