@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/isitobservable/k8s-networking-mcp/pkg/types"
 )
@@ -334,18 +336,22 @@ func (t *ListGatewaysTool) Run(ctx context.Context, args map[string]interface{})
 		conditions, _, _ := unstructured.NestedSlice(item.Object, "status", "conditions")
 		gatewayClass := getNestedString(item.Object, "spec", "gatewayClassName")
 
-		// Count attached routes from listener status (float64 from JSON)
+		// Count attached routes and build listener status map
 		listenerStatuses, _, _ := unstructured.NestedSlice(item.Object, "status", "listeners")
 		attachedRoutes := 0
+		listenerStatusMap := make(map[string]map[string]interface{})
 		for _, ls := range listenerStatuses {
 			if lsm, ok := ls.(map[string]interface{}); ok {
 				if count, ok := lsm["attachedRoutes"].(float64); ok {
 					attachedRoutes += int(count)
 				}
+				if lsName, ok := lsm["name"].(string); ok {
+					listenerStatusMap[lsName] = lsm
+				}
 			}
 		}
 
-		// Build listener summary strings
+		// Build listener summary strings with conditional status
 		listenerParts := make([]string, 0, len(listeners))
 		for _, l := range listeners {
 			if lm, ok := l.(map[string]interface{}); ok {
@@ -356,6 +362,21 @@ func (t *ListGatewaysTool) Run(ctx context.Context, args map[string]interface{})
 				part := fmt.Sprintf("%s:%s/%s", name, port, protocol)
 				if hostname != "" {
 					part += fmt.Sprintf(" hostname=%s", hostname)
+				}
+				// Conditional: show listener status only when unhealthy
+				if lsm, ok := listenerStatusMap[name]; ok {
+					if conds, ok := lsm["conditions"].([]interface{}); ok {
+						for _, c := range conds {
+							if cm, ok := c.(map[string]interface{}); ok {
+								cStatus, _ := cm["status"].(string)
+								cType, _ := cm["type"].(string)
+								cReason, _ := cm["reason"].(string)
+								if cStatus == "False" && (cType == "Accepted" || cType == "Programmed" || cType == "Ready" || cType == "ResolvedRefs") {
+									part += fmt.Sprintf(" ⚠%s(%s)", cType, cReason)
+								}
+							}
+						}
+					}
 				}
 				listenerParts = append(listenerParts, part)
 			}
@@ -499,16 +520,39 @@ func (t *GetGatewayTool) Run(ctx context.Context, args map[string]interface{}) (
 		}
 
 		severity := types.SeverityInfo
+		suggestion := ""
 		if hasUnhealthyCondition(listenerConditions) {
 			severity = types.SeverityWarning
+			// Add specific condition problems to summary
+			for _, c := range listenerConditions {
+				if cm, ok := c.(map[string]interface{}); ok {
+					cStatus, _ := cm["status"].(string)
+					cType, _ := cm["type"].(string)
+					cReason, _ := cm["reason"].(string)
+					if cStatus == "False" {
+						lSummary += fmt.Sprintf(" ⚠ %s=False(%s)", cType, cReason)
+					}
+				}
+			}
+			suggestion = "Check listener configuration, TLS certificates, and supported protocols"
+		}
+
+		lDetail := formatConditions(listenerConditions)
+		// Fetch events for unhealthy listeners (conditional enrichment)
+		if severity == types.SeverityWarning {
+			events := fetchRecentEvents(ctx, t.Clients.Clientset, ns, "Gateway", name)
+			if len(events) > 0 {
+				lDetail += "\nRecent events: " + strings.Join(events, "; ")
+			}
 		}
 
 		findings = append(findings, types.DiagnosticFinding{
-			Severity: severity,
-			Category: types.CategoryRouting,
-			Resource: gwRef,
-			Summary:  lSummary,
-			Detail:   formatConditions(listenerConditions),
+			Severity:   severity,
+			Category:   types.CategoryRouting,
+			Resource:   gwRef,
+			Summary:    lSummary,
+			Detail:     lDetail,
+			Suggestion: suggestion,
 		})
 	}
 
@@ -655,13 +699,24 @@ func (t *ListHTTPRoutesTool) Run(ctx context.Context, args map[string]interface{
 			strings.Join(allBackends, ", "),
 			policyInfo)
 
+		// Conditional route status enrichment: only show when problems detected
+		statusSuffix, hasStatusProblem := extractRouteStatusSuffix(item.Object)
+		if statusSuffix != "" {
+			summary += " " + statusSuffix
+		}
+
+		severity := types.SeverityInfo
+		if hasStatusProblem {
+			severity = types.SeverityWarning
+		}
+
 		detail := ""
 		if len(ruleSummaries) > 0 {
 			detail = strings.Join(ruleSummaries, " | ")
 		}
 
 		findings = append(findings, types.DiagnosticFinding{
-			Severity: types.SeverityInfo,
+			Severity: severity,
 			Category: types.CategoryRouting,
 			Resource: &types.ResourceRef{
 				Kind:       "HTTPRoute",
@@ -710,6 +765,10 @@ func (t *GetHTTPRouteTool) Run(ctx context.Context, args map[string]interface{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get httproute %s/%s: %w", ns, name, err)
 	}
+
+	// Fetch ReferenceGrants for cross-namespace validation
+	refGrantList, _ := listWithFallback(ctx, t.Clients.Dynamic, refGrantsV1GVR, refGrantsV1B1GVR, "")
+	refGrants := buildRefGrants(refGrantList)
 
 	routeRef := &types.ResourceRef{
 		Kind:       "HTTPRoute",
@@ -922,6 +981,32 @@ func (t *GetHTTPRouteTool) Run(ctx context.Context, args map[string]interface{})
 		}
 	}
 
+	// Cross-namespace reference validation
+	for _, r := range rules {
+		rm, ok := r.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		brs, ok := rm["backendRefs"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, br := range brs {
+			brm, ok := br.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			refName, _ := brm["name"].(string)
+			refNs := ns
+			if rns, ok := brm["namespace"].(string); ok && rns != "" {
+				refNs = rns
+			}
+			if finding := validateCrossNamespaceRef(ns, "HTTPRoute", refNs, refName, refGrants, routeRef); finding != nil {
+				findings = append(findings, *finding)
+			}
+		}
+	}
+
 	return NewToolResultResponse(t.Cfg, t.Name(), findings, ns, "gateway-api"), nil
 }
 
@@ -1010,13 +1095,24 @@ func (t *ListGRPCRoutesTool) Run(ctx context.Context, args map[string]interface{
 			strings.Join(allBackends, ", "),
 			policyInfo)
 
+		// Conditional route status enrichment: only show when problems detected
+		statusSuffix, hasStatusProblem := extractRouteStatusSuffix(item.Object)
+		if statusSuffix != "" {
+			summary += " " + statusSuffix
+		}
+
+		severity := types.SeverityInfo
+		if hasStatusProblem {
+			severity = types.SeverityWarning
+		}
+
 		detail := ""
 		if len(ruleSummaries) > 0 {
 			detail = strings.Join(ruleSummaries, " | ")
 		}
 
 		findings = append(findings, types.DiagnosticFinding{
-			Severity: types.SeverityInfo,
+			Severity: severity,
 			Category: types.CategoryRouting,
 			Resource: &types.ResourceRef{
 				Kind:       "GRPCRoute",
@@ -1065,6 +1161,10 @@ func (t *GetGRPCRouteTool) Run(ctx context.Context, args map[string]interface{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get grpcroute %s/%s: %w", ns, name, err)
 	}
+
+	// Fetch ReferenceGrants for cross-namespace validation
+	refGrantList, _ := listWithFallback(ctx, t.Clients.Dynamic, refGrantsV1GVR, refGrantsV1B1GVR, "")
+	refGrants := buildRefGrants(refGrantList)
 
 	routeRef := &types.ResourceRef{
 		Kind:       "GRPCRoute",
@@ -1274,6 +1374,32 @@ func (t *GetGRPCRouteTool) Run(ctx context.Context, args map[string]interface{})
 						Suggestion: "Check that the parent gateway and listener accept this GRPCRoute",
 					})
 				}
+			}
+		}
+	}
+
+	// Cross-namespace reference validation
+	for _, r := range rules {
+		rm, ok := r.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		brs, ok := rm["backendRefs"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, br := range brs {
+			brm, ok := br.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			refName, _ := brm["name"].(string)
+			refNs := ns
+			if rns, ok := brm["namespace"].(string); ok && rns != "" {
+				refNs = rns
+			}
+			if finding := validateCrossNamespaceRef(ns, "GRPCRoute", refNs, refName, refGrants, routeRef); finding != nil {
+				findings = append(findings, *finding)
 			}
 		}
 	}
@@ -1583,35 +1709,7 @@ func (t *ScanGatewayMisconfigsTool) Run(ctx context.Context, args map[string]int
 	}
 
 	// refGrants: build set of allowed cross-namespace refs
-	// key: "fromNamespace/fromKind -> toNamespace" = true
-	type refGrantEntry struct {
-		fromNs   string
-		fromKind string
-		toNs     string
-	}
-	var refGrants []refGrantEntry
-	if refGrantList != nil {
-		for _, rg := range refGrantList.Items {
-			toNs := rg.GetNamespace()
-			fromRefs, _, _ := unstructured.NestedSlice(rg.Object, "spec", "from")
-			for _, f := range fromRefs {
-				if fm, ok := f.(map[string]interface{}); ok {
-					fromNs, _ := fm["namespace"].(string)
-					fromKind, _ := fm["kind"].(string)
-					refGrants = append(refGrants, refGrantEntry{fromNs: fromNs, fromKind: fromKind, toNs: toNs})
-				}
-			}
-		}
-	}
-
-	hasRefGrant := func(fromNs, fromKind, toNs string) bool {
-		for _, rg := range refGrants {
-			if rg.fromNs == fromNs && rg.toNs == toNs && (rg.fromKind == fromKind || rg.fromKind == "") {
-				return true
-			}
-		}
-		return false
-	}
+	refGrants := buildRefGrants(refGrantList)
 
 	var findings []types.DiagnosticFinding
 
@@ -1773,16 +1871,8 @@ func (t *ScanGatewayMisconfigsTool) Run(ctx context.Context, args map[string]int
 				}
 
 				// Check 4: Cross-namespace references missing ReferenceGrants
-				if refNs != route.namespace {
-					if !hasRefGrant(route.namespace, route.kind, refNs) {
-						findings = append(findings, types.DiagnosticFinding{
-							Severity:   types.SeverityWarning,
-							Category:   types.CategoryPolicy,
-							Resource:   routeRef,
-							Summary:    fmt.Sprintf("%s %s/%s references backend %s/%s across namespaces but no ReferenceGrant allows this", route.kind, route.namespace, route.name, refNs, refName),
-							Suggestion: fmt.Sprintf("Create a ReferenceGrant in namespace %s allowing %s from namespace %s", refNs, route.kind, route.namespace),
-						})
-					}
+				if finding := validateCrossNamespaceRef(route.namespace, route.kind, refNs, refName, refGrants, routeRef); finding != nil {
+					findings = append(findings, *finding)
 				}
 			}
 
@@ -2525,6 +2615,155 @@ func hasUnhealthyCondition(conditions []interface{}) bool {
 		}
 	}
 	return false
+}
+
+// refGrantEntry represents a single ReferenceGrant from→to mapping.
+type refGrantEntry struct {
+	fromNs   string
+	fromKind string
+	toNs     string
+}
+
+// buildRefGrants extracts refGrantEntry list from a ReferenceGrant list.
+func buildRefGrants(refGrantList *unstructured.UnstructuredList) []refGrantEntry {
+	if refGrantList == nil {
+		return nil
+	}
+	var entries []refGrantEntry
+	for _, rg := range refGrantList.Items {
+		toNs := rg.GetNamespace()
+		fromRefs, _, _ := unstructured.NestedSlice(rg.Object, "spec", "from")
+		for _, f := range fromRefs {
+			if fm, ok := f.(map[string]interface{}); ok {
+				fromNs, _ := fm["namespace"].(string)
+				fromKind, _ := fm["kind"].(string)
+				entries = append(entries, refGrantEntry{fromNs: fromNs, fromKind: fromKind, toNs: toNs})
+			}
+		}
+	}
+	return entries
+}
+
+// hasRefGrant checks if any ReferenceGrant allows cross-namespace reference.
+func hasRefGrant(refGrants []refGrantEntry, fromNs, fromKind, toNs string) bool {
+	for _, rg := range refGrants {
+		if rg.fromNs == fromNs && rg.toNs == toNs && (rg.fromKind == fromKind || rg.fromKind == "") {
+			return true
+		}
+	}
+	return false
+}
+
+// validateCrossNamespaceRef checks if a cross-namespace backendRef has a valid ReferenceGrant.
+// Returns nil if same-namespace or grant exists, warning finding if grant missing.
+func validateCrossNamespaceRef(routeNs, routeKind, backendNs, backendName string, refGrants []refGrantEntry, routeRef *types.ResourceRef) *types.DiagnosticFinding {
+	if backendNs == routeNs {
+		return nil
+	}
+	if hasRefGrant(refGrants, routeNs, routeKind, backendNs) {
+		return nil
+	}
+	return &types.DiagnosticFinding{
+		Severity:   types.SeverityWarning,
+		Category:   types.CategoryPolicy,
+		Resource:   routeRef,
+		Summary:    fmt.Sprintf("%s %s/%s references backend %s/%s across namespaces but no ReferenceGrant allows this", routeKind, routeNs, routeRef.Name, backendNs, backendName),
+		Suggestion: fmt.Sprintf("Create a ReferenceGrant in namespace %s allowing %s from namespace %s", backendNs, routeKind, routeNs),
+	}
+}
+
+// extractRouteStatusSuffix extracts route acceptance status from status.parents.
+// Returns empty string and false when all parents are accepted (happy path).
+// Returns status suffix and true when problems are detected.
+func extractRouteStatusSuffix(obj map[string]interface{}) (string, bool) {
+	parentStatuses, _, _ := unstructured.NestedSlice(obj, "status", "parents")
+	if len(parentStatuses) == 0 {
+		return "", false
+	}
+
+	var problems []string
+	for _, ps := range parentStatuses {
+		psm, ok := ps.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		parentRef, _ := psm["parentRef"].(map[string]interface{})
+		controllerName, _ := psm["controllerName"].(string)
+		pName := ""
+		if parentRef != nil {
+			pName, _ = parentRef["name"].(string)
+		}
+
+		conds, ok := psm["conditions"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, c := range conds {
+			cm, ok := c.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			status, _ := cm["status"].(string)
+			condType, _ := cm["type"].(string)
+			reason, _ := cm["reason"].(string)
+
+			if status != "False" {
+				continue
+			}
+
+			controller := controllerName
+			if controller == "" {
+				controller = pName
+			}
+
+			switch condType {
+			case "Accepted":
+				problems = append(problems, fmt.Sprintf("⚠ NOT_ACCEPTED(%s) via %s", reason, controller))
+			case "ResolvedRefs":
+				problems = append(problems, fmt.Sprintf("⚠ UNRESOLVED_REFS(%s) via %s", reason, controller))
+			}
+		}
+	}
+
+	if len(problems) == 0 {
+		return "", false
+	}
+	return strings.Join(problems, " "), true
+}
+
+// fetchRecentEvents fetches recent Kubernetes events for a specific resource.
+// Returns formatted event messages. Silently returns nil on errors (RBAC, etc).
+func fetchRecentEvents(ctx context.Context, clientset kubernetes.Interface, ns, kind, name string) []string {
+	if clientset == nil {
+		return nil
+	}
+
+	oneHourAgo := time.Now().Add(-1 * time.Hour)
+	fieldSelector := fmt.Sprintf("involvedObject.name=%s,involvedObject.kind=%s", name, kind)
+	events, err := clientset.CoreV1().Events(ns).List(ctx, metav1.ListOptions{
+		FieldSelector: fieldSelector,
+	})
+	if err != nil {
+		return nil
+	}
+
+	var result []string
+	for _, e := range events.Items {
+		eventTime := e.LastTimestamp.Time
+		if eventTime.IsZero() {
+			eventTime = e.CreationTimestamp.Time
+		}
+		if eventTime.Before(oneHourAgo) {
+			continue
+		}
+		result = append(result, fmt.Sprintf("[%s] %s: %s", e.Type, e.Reason, e.Message))
+	}
+
+	// Limit to last 5 events
+	if len(result) > 5 {
+		result = result[len(result)-5:]
+	}
+	return result
 }
 
 func getNestedString(obj map[string]interface{}, fields ...string) string {
