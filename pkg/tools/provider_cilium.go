@@ -8,6 +8,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 
 	"github.com/isitobservable/k8s-networking-mcp/pkg/types"
 )
@@ -47,8 +48,8 @@ func countCiliumRules(ingress, egress []interface{}) ciliumRuleCounts {
 				if ports, ok := tpm["ports"].([]interface{}); ok && len(ports) > 0 {
 					counts.l4PortRules += len(ports)
 				}
-				rules, _, _ := unstructured.NestedMap(tpm, "rules")
-				if len(rules) > 0 {
+				l7rules, _, _ := unstructured.NestedMap(tpm, "rules")
+				if len(l7rules) > 0 {
 					counts.l7Rules++
 				}
 			}
@@ -238,7 +239,7 @@ func (t *GetCiliumPolicyTool) Run(ctx context.Context, args map[string]interface
 
 	// --- Cross-reference: find services whose pod selectors overlap ---
 	if len(selectorLabels) > 0 {
-		affectedSvcs := findServicesMatchingLabels(ctx, t, ns, selectorLabels)
+		affectedSvcs := findServicesMatchingLabels(ctx, t.Clients.Dynamic, ns, selectorLabels)
 		if len(affectedSvcs) > 0 {
 			findings = append(findings, types.DiagnosticFinding{
 				Severity: types.SeverityInfo,
@@ -419,8 +420,8 @@ func describeCiliumRule(rule map[string]interface{}, direction string, index int
 
 // findServicesMatchingLabels lists services in ns and returns names whose pod selector
 // labels are a superset of (or equal to) the given label set.
-func findServicesMatchingLabels(ctx context.Context, t *GetCiliumPolicyTool, ns string, policyLabels map[string]string) []string {
-	svcList, err := t.Clients.Dynamic.Resource(servicesGVR).Namespace(ns).List(ctx, metav1.ListOptions{})
+func findServicesMatchingLabels(ctx context.Context, dynClient dynamic.Interface, ns string, policyLabels map[string]string) []string {
+	svcList, err := dynClient.Resource(servicesGVR).Namespace(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil
 	}
@@ -439,14 +440,9 @@ func findServicesMatchingLabels(ctx context.Context, t *GetCiliumPolicyTool, ns 
 	return matched
 }
 
-// labelsSubsetOf returns true if every key/value in sub is present in super.
+// labelsSubsetOf delegates to labelsMatch (identical semantics: every key/value in sub must exist in super).
 func labelsSubsetOf(sub, super map[string]string) bool {
-	for k, v := range sub {
-		if sv, ok := super[k]; !ok || sv != v {
-			return false
-		}
-	}
-	return true
+	return labelsMatch(sub, super)
 }
 
 // orAny returns s if non-empty, otherwise "*".

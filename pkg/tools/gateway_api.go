@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -2160,7 +2161,7 @@ func (t *ScanGatewayMisconfigsTool) checkWaypointProxies(ctx context.Context, al
 						podReady = false
 					}
 				}
-				if podReady && pod.Status.Phase == "Running" {
+				if podReady && pod.Status.Phase == corev1.PodRunning {
 					ready++
 				}
 			}

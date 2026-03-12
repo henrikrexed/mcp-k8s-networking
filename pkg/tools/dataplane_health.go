@@ -10,10 +10,10 @@ import (
 	"github.com/isitobservable/k8s-networking-mcp/pkg/types"
 )
 
-// sidecarContainerNames are the well-known mesh sidecar container names.
+// sidecarContainerNames are the well-known mesh sidecar container names injected into workload pods.
+// Note: cilium-agent runs as a DaemonSet pod, not as a sidecar, so it is not included here.
 var sidecarContainerNames = map[string]bool{
-	"istio-proxy":  true,
-	"cilium-agent": true,
+	"istio-proxy":   true,
 	"linkerd-proxy": true,
 }
 
@@ -83,21 +83,26 @@ func (t *CheckDataplaneHealthTool) Run(ctx context.Context, args map[string]inte
 				restartCount int32
 			}{ready: cs.Ready, restartCount: cs.RestartCount}
 		}
-		// Also include init container statuses.
-		initCSMap := make(map[string]struct {
-			exitCode int32
-			reason   string
-		})
+		// Also include init container statuses (for native sidecars and mesh init containers).
+		type initCSInfo struct {
+			ready        bool
+			restartCount int32
+			exitCode     int32
+			reason       string
+			terminated   bool
+		}
+		initCSMap := make(map[string]initCSInfo)
 		for _, ics := range pod.Status.InitContainerStatuses {
-			if ics.State.Terminated != nil {
-				initCSMap[ics.Name] = struct {
-					exitCode int32
-					reason   string
-				}{
-					exitCode: ics.State.Terminated.ExitCode,
-					reason:   ics.State.Terminated.Reason,
-				}
+			info := initCSInfo{
+				ready:        ics.Ready,
+				restartCount: ics.RestartCount,
 			}
+			if ics.State.Terminated != nil {
+				info.terminated = true
+				info.exitCode = ics.State.Terminated.ExitCode
+				info.reason = ics.State.Terminated.Reason
+			}
+			initCSMap[ics.Name] = info
 		}
 
 		// Collect all containers (regular + init) to find sidecars.
@@ -157,13 +162,9 @@ func (t *CheckDataplaneHealthTool) Run(ctx context.Context, args map[string]inte
 		for _, ic := range pod.Spec.InitContainers {
 			if sidecarContainerNames[ic.Name] {
 				foundSidecar = true
-				// Native sidecar in init containers: check its status too.
-				// For native sidecars, status appears in InitContainerStatuses.
-				for _, ics := range pod.Status.InitContainerStatuses {
-					if ics.Name != ic.Name {
-						continue
-					}
-					if !ics.Ready {
+				// Native sidecar in init containers: check its status via map lookup.
+				if ics, ok := initCSMap[ic.Name]; ok {
+					if !ics.ready {
 						findings = append(findings, types.DiagnosticFinding{
 							Severity:   types.SeverityWarning,
 							Category:   types.CategoryMesh,
@@ -173,13 +174,13 @@ func (t *CheckDataplaneHealthTool) Run(ctx context.Context, args map[string]inte
 							Suggestion: "Check the sidecar container logs and ensure the control plane is reachable.",
 						})
 					}
-					if ics.RestartCount > 0 {
+					if ics.restartCount > 0 {
 						findings = append(findings, types.DiagnosticFinding{
 							Severity:   types.SeverityWarning,
 							Category:   types.CategoryMesh,
 							Resource:   podRef,
-							Summary:    fmt.Sprintf("Native sidecar %q (init container) has restarted %d time(s) in pod %s/%s", ic.Name, ics.RestartCount, pod.Namespace, pod.Name),
-							Detail:     fmt.Sprintf("container=%s restartCount=%d", ic.Name, ics.RestartCount),
+							Summary:    fmt.Sprintf("Native sidecar %q (init container) has restarted %d time(s) in pod %s/%s", ic.Name, ics.restartCount, pod.Namespace, pod.Name),
+							Detail:     fmt.Sprintf("container=%s restartCount=%d", ic.Name, ics.restartCount),
 							Suggestion: "Investigate sidecar crash logs for OOM or configuration errors.",
 						})
 					}
@@ -188,7 +189,7 @@ func (t *CheckDataplaneHealthTool) Run(ctx context.Context, args map[string]inte
 
 			// Check mesh init containers for non-zero exit codes.
 			if meshInitContainerNames[ic.Name] {
-				if status, ok := initCSMap[ic.Name]; ok && status.exitCode != 0 {
+				if status, ok := initCSMap[ic.Name]; ok && status.terminated && status.exitCode != 0 {
 					findings = append(findings, types.DiagnosticFinding{
 						Severity:   types.SeverityWarning,
 						Category:   types.CategoryMesh,
@@ -208,7 +209,7 @@ func (t *CheckDataplaneHealthTool) Run(ctx context.Context, args map[string]inte
 				Category: types.CategoryMesh,
 				Resource: podRef,
 				Summary:  fmt.Sprintf("No mesh sidecar detected in pod %s/%s", pod.Namespace, pod.Name),
-				Detail:   "No istio-proxy, cilium-agent, or linkerd-proxy container found.",
+				Detail:   "No istio-proxy or linkerd-proxy sidecar container found.",
 			})
 		}
 	}
