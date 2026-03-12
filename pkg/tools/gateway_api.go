@@ -26,6 +26,14 @@ var (
 	refGrantsV1GVR    = schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "referencegrants"}
 )
 
+// routeInfo holds metadata for a route resource used during misconfiguration scanning.
+type routeInfo struct {
+	kind      string
+	name      string
+	namespace string
+	obj       map[string]interface{}
+}
+
 // listWithFallback tries listing with the v1 GVR first, falling back to v1beta1.
 func listWithFallback(ctx context.Context, client dynamic.Interface, v1, v1beta1 schema.GroupVersionResource, ns string) (*unstructured.UnstructuredList, error) {
 	var ri dynamic.ResourceInterface
@@ -1795,12 +1803,6 @@ func (t *ScanGatewayMisconfigsTool) Run(ctx context.Context, args map[string]int
 	}
 
 	// Helper to scan routes for misconfigs
-	type routeInfo struct {
-		kind      string
-		name      string
-		namespace string
-		obj       map[string]interface{}
-	}
 	var allRoutes []routeInfo
 	if httpRouteList != nil {
 		for _, r := range httpRouteList.Items {
@@ -2004,6 +2006,9 @@ func (t *ScanGatewayMisconfigsTool) Run(ctx context.Context, args map[string]int
 		}
 	}
 
+	// --- Check 6: Waypoint proxy health for GAMMA mesh routes ---
+	findings = append(findings, t.checkWaypointProxies(ctx, allRoutes, gwList)...)
+
 	if len(findings) == 0 {
 		responseNs := ns
 		if responseNs == "" {
@@ -2021,6 +2026,165 @@ func (t *ScanGatewayMisconfigsTool) Run(ctx context.Context, args map[string]int
 		responseNs = "all"
 	}
 	return NewToolResultResponse(t.Cfg, t.Name(), findings, responseNs, "gateway-api"), nil
+}
+
+// checkWaypointProxies detects GAMMA (mesh) routes using Service parentRefs and validates
+// waypoint proxy health: istio.io/use-waypoint label, waypoint Gateway existence and status, pod readiness.
+func (t *ScanGatewayMisconfigsTool) checkWaypointProxies(ctx context.Context, allRoutes []routeInfo, gwList *unstructured.UnstructuredList) []types.DiagnosticFinding {
+	// Collect unique service parentRefs (GAMMA mesh routes)
+	type gammaRef struct {
+		ns   string
+		name string
+	}
+	seen := make(map[gammaRef]bool)
+
+	for _, route := range allRoutes {
+		parentRefs, _, _ := unstructured.NestedSlice(route.obj, "spec", "parentRefs")
+		for _, pr := range parentRefs {
+			prm, ok := pr.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			kind, _ := prm["kind"].(string)
+			if kind != "Service" {
+				continue
+			}
+			refName, _ := prm["name"].(string)
+			refNs, _ := prm["namespace"].(string)
+			if refNs == "" {
+				refNs = route.namespace
+			}
+			seen[gammaRef{ns: refNs, name: refName}] = true
+		}
+	}
+
+	if len(seen) == 0 {
+		return nil // No GAMMA routes, no waypoint checks needed
+	}
+
+	var findings []types.DiagnosticFinding
+
+	// Build a set of waypoint gateway names from Gateways with GatewayClass "istio-waypoint"
+	waypointGateways := make(map[string]*unstructured.Unstructured) // "ns/name" -> gateway
+	if gwList != nil {
+		for i := range gwList.Items {
+			gw := &gwList.Items[i]
+			gc := getNestedString(gw.Object, "spec", "gatewayClassName")
+			if gc == "istio-waypoint" {
+				key := gw.GetNamespace() + "/" + gw.GetName()
+				waypointGateways[key] = gw
+			}
+		}
+	}
+
+	// For each GAMMA service, check waypoint label and gateway health
+	checkedNs := make(map[string]bool)
+	for ref := range seen {
+		// Check service-level waypoint label
+		svc, svcErr := t.Clients.Clientset.CoreV1().Services(ref.ns).Get(ctx, ref.name, metav1.GetOptions{})
+		var waypointName string
+		if svcErr == nil {
+			waypointName = svc.Labels["istio.io/use-waypoint"]
+		}
+
+		// If no service-level label, check namespace-level
+		if waypointName == "" && !checkedNs[ref.ns] {
+			checkedNs[ref.ns] = true
+			nsObj, nsErr := t.Clients.Clientset.CoreV1().Namespaces().Get(ctx, ref.ns, metav1.GetOptions{})
+			if nsErr == nil {
+				waypointName = nsObj.Labels["istio.io/use-waypoint"]
+			}
+		}
+
+		if waypointName == "" {
+			// No waypoint configured — not an error, just no ambient mesh waypoint
+			continue
+		}
+
+		// Verify waypoint Gateway exists and is Programmed
+		waypointKey := ref.ns + "/" + waypointName
+		wpGw, exists := waypointGateways[waypointKey]
+		svcRef := &types.ResourceRef{
+			Kind:      "Service",
+			Namespace: ref.ns,
+			Name:      ref.name,
+		}
+
+		if !exists {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity:   types.SeverityWarning,
+				Category:   types.CategoryRouting,
+				Resource:   svcRef,
+				Summary:    fmt.Sprintf("Service %s/%s has istio.io/use-waypoint=%s but waypoint Gateway %s not found", ref.ns, ref.name, waypointName, waypointKey),
+				Suggestion: "Create a waypoint Gateway with GatewayClass istio-waypoint, or remove the label",
+			})
+			continue
+		}
+
+		// Check waypoint Gateway conditions
+		conditions, _, _ := unstructured.NestedSlice(wpGw.Object, "status", "conditions")
+		programmed := false
+		for _, c := range conditions {
+			cm, ok := c.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			cType, _ := cm["type"].(string)
+			cStatus, _ := cm["status"].(string)
+			if cType == "Programmed" && cStatus == "True" {
+				programmed = true
+			}
+		}
+		if !programmed {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity:   types.SeverityWarning,
+				Category:   types.CategoryRouting,
+				Resource:   svcRef,
+				Summary:    fmt.Sprintf("Waypoint Gateway %s is not Programmed for service %s/%s", waypointKey, ref.ns, ref.name),
+				Suggestion: "Check waypoint Gateway status and istio-waypoint GatewayClass controller",
+			})
+		}
+
+		// Check waypoint pod readiness
+		wpPods, podErr := t.Clients.Clientset.CoreV1().Pods(ref.ns).List(ctx, metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("gateway.networking.k8s.io/gateway-name=%s", waypointName),
+			Limit:         10,
+		})
+		if podErr == nil && len(wpPods.Items) > 0 {
+			total := len(wpPods.Items)
+			ready := 0
+			for _, pod := range wpPods.Items {
+				podReady := true
+				for _, cs := range pod.Status.ContainerStatuses {
+					if !cs.Ready {
+						podReady = false
+					}
+				}
+				if podReady && pod.Status.Phase == "Running" {
+					ready++
+				}
+			}
+			if ready < total {
+				findings = append(findings, types.DiagnosticFinding{
+					Severity:   types.SeverityWarning,
+					Category:   types.CategoryRouting,
+					Resource:   svcRef,
+					Summary:    fmt.Sprintf("Waypoint proxy pods for %s: %d/%d ready", waypointKey, ready, total),
+					Suggestion: "Check waypoint proxy pod logs and events",
+				})
+			}
+		} else if podErr == nil && len(wpPods.Items) == 0 {
+			findings = append(findings, types.DiagnosticFinding{
+				Severity:   types.SeverityWarning,
+				Category:   types.CategoryRouting,
+				Resource:   svcRef,
+				Summary:    fmt.Sprintf("Waypoint Gateway %s has no proxy pods", waypointKey),
+				Suggestion: "Verify the waypoint Gateway controller is deploying proxy pods",
+			})
+		}
+	}
+
+	return findings
 }
 
 // --- check_gateway_conformance ---

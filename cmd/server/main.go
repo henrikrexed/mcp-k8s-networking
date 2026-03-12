@@ -76,6 +76,9 @@ func main() {
 	registry.Register(&tools.ProbeDNSTool{BaseTool: base, ProbeManager: probeMgr})
 	registry.Register(&tools.ProbeHTTPTool{BaseTool: base, ProbeManager: probeMgr})
 
+	// Register data plane health tool (always available — gracefully returns info findings when no sidecars found)
+	registry.Register(&tools.CheckDataplaneHealthTool{BaseTool: base})
+
 	// Create skills registry
 	skillsRegistry := skills.NewRegistry()
 
@@ -97,7 +100,7 @@ func main() {
 	kgatewayToolNames := []string{"list_kgateway_resources", "validate_kgateway_resource", "check_kgateway_health", "design_kgateway"}
 	kumaToolNames := []string{"check_kuma_status"}
 	linkerdToolNames := []string{"check_linkerd_status"}
-	ciliumToolNames := []string{"list_cilium_policies", "check_cilium_status"}
+	ciliumToolNames := []string{"list_cilium_policies", "check_cilium_status", "get_cilium_policy"}
 	calicoToolNames := []string{"list_calico_policies", "check_calico_status"}
 	flannelToolNames := []string{"check_flannel_status"}
 
@@ -173,6 +176,7 @@ func main() {
 		if features.HasCilium {
 			registry.Register(&tools.ListCiliumPoliciesTool{BaseTool: base})
 			registry.Register(&tools.CheckCiliumStatusTool{BaseTool: base})
+			registry.Register(&tools.GetCiliumPolicyTool{BaseTool: base})
 		} else {
 			for _, name := range ciliumToolNames {
 				registry.Unregister(name)
