@@ -9,12 +9,12 @@ mcp-k8s-networking is a diagnostic server that AI agents connect to via the MCP 
 ## Key Features
 
 - **Dynamic CRD Discovery** - Automatically detects installed networking CRDs via watch and registers/unregisters tools in real-time
-- **40+ Diagnostic Tools** - Covering core Kubernetes, Gateway API, Istio, kgateway, and Tier 2 providers
+- **52 Diagnostic Tools** - Covering core Kubernetes, Gateway API, Istio, kgateway, and Tier 2 providers
 - **Active Probing** - Deploy ephemeral pods to test connectivity, DNS, and HTTP reachability
 - **Design Guidance** - Generate provider-specific YAML templates based on user intent
 - **Agent Skills** - Multi-step playbooks for common networking tasks
-- **Structured Diagnostics** - Consistent `DiagnosticFinding` format with severity, category, and remediation suggestions
-- **Production Ready** - Helm chart, RBAC, health probes, structured logging, OpenTelemetry support
+- **Structured Diagnostics** - Compact markdown tables with severity icons, optimized for LLM token efficiency
+- **Production Ready** - Helm chart, RBAC, health probes, structured logging, full OpenTelemetry instrumentation
 
 ## Supported Providers
 
@@ -23,7 +23,7 @@ mcp-k8s-networking is a diagnostic server that AI agents connect to via the MCP 
 | Gateway API | 1 | Full diagnostics, validation, conformance, design guidance |
 | Istio | 1 | Full diagnostics, mTLS, routing analysis, design guidance |
 | kgateway | 1 | Resource validation, health summary, design guidance |
-| Cilium | 2 | NetworkPolicy listing, agent health |
+| Cilium | 2 | NetworkPolicy listing with L7 rules, agent health |
 | Calico | 2 | NetworkPolicy listing, node health |
 | Linkerd | 2 | Control plane health, injection status |
 | Kuma | 2 | Control plane health, mesh/dataplane status |
@@ -93,8 +93,8 @@ See the full [MCP Skill Installation](mcp-skill-installation.md) guide for Claud
 
 mcp-k8s-networking has built-in OpenTelemetry instrumentation that exports traces, metrics, and logs via OTLP gRPC. Enable it by setting the `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable or the `otel.enabled` Helm value.
 
-- **Traces** - Every tool call produces a span with GenAI + MCP semantic convention attributes
+- **Traces** - MCP tool call spans, K8s API call spans, probe lifecycle spans with full context propagation
 - **Metrics** - Request duration histograms, request counts, finding counts, error counts
-- **Logs** - Structured JSON logs with automatic trace_id/span_id correlation
+- **Logs** - Structured JSON logs with automatic trace_id/span_id correlation via slog-OTel bridge
 
 See the [Observability](observability.md) guide for full details including backend integration examples.

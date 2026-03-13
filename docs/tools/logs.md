@@ -1,45 +1,91 @@
 # Log Collection Tools
 
-Always available.
+These 4 tools are always available. They retrieve and analyze logs from networking components.
+
+---
 
 ## get_proxy_logs
 
-Retrieve logs from proxy sidecar containers (istio-proxy, envoy, linkerd-proxy).
+Get logs from Envoy/proxy sidecars (auto-detects istio-proxy, envoy, linkerd-proxy containers).
 
 **Parameters:**
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `pod` | string | Yes | Pod name |
-| `namespace` | string | Yes | Namespace |
-| `tail` | integer | No | Number of lines (default: 100) |
-| `since` | string | No | Time duration (e.g., "5m", "1h") |
+| `namespace` | string | Yes | Kubernetes namespace |
+| `container` | string | No | Container name (auto-detects proxy container if not specified) |
+| `tail` | integer | No | Number of lines from the end (default: 100) |
+| `since` | string | No | Duration to look back (e.g., `5m`, `1h`) |
+
+**Example use cases:**
+
+- Inspect Envoy access logs for 5xx errors
+- Check istio-proxy startup logs after sidecar injection
+- Review linkerd-proxy connection errors
+
+---
 
 ## get_gateway_logs
 
-Retrieve logs from gateway controller pods.
-
-## get_infra_logs
-
-Retrieve logs from infrastructure components.
+Get logs from Gateway controller pods and Gateway API provider pods.
 
 **Parameters:**
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `component` | string | Yes | Component: kube-proxy, coredns, or cni |
-| `tail` | integer | No | Number of lines |
+| `gateway_name` | string | No | Gateway resource name (discovers controller pods by labels) |
+| `namespace` | string | No | Namespace to search in (default: all common namespaces) |
+| `tail` | integer | No | Number of lines from the end (default: 100) |
+| `since` | string | No | Duration to look back (e.g., `5m`, `1h`) |
+
+**Example use cases:**
+
+- Debug why a Gateway is not accepting routes
+- Check controller reconciliation errors
+- Review provider-specific gateway pod logs
+
+---
+
+## get_infra_logs
+
+Get logs from kube-proxy, CoreDNS, or CNI pods.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `component` | string | Yes | Infrastructure component: `kube-proxy`, `coredns`, or `cni` |
+| `namespace` | string | No | Namespace override (default: `kube-system`) |
+| `tail` | integer | No | Number of lines from the end (default: 100) |
+| `since` | string | No | Duration to look back (e.g., `5m`, `1h`) |
+
+**Example use cases:**
+
+- Check CoreDNS logs for NXDOMAIN or timeout errors
+- Review kube-proxy iptables sync errors
+- Inspect CNI plugin logs for pod networking failures
+
+---
 
 ## analyze_log_errors
 
-Analyze pod logs and extract categorized error patterns.
+Read logs and extract error/warning lines related to misconfig, rate limiting, connection issues, TLS errors.
 
 **Parameters:**
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `pod` | string | Yes | Pod name |
-| `namespace` | string | Yes | Namespace |
-| `lines` | integer | No | Lines to scan (default: 500) |
+| `namespace` | string | Yes | Kubernetes namespace |
+| `container` | string | No | Container name (optional, uses first container) |
+| `tail` | integer | No | Number of lines to analyze (default: 500) |
+| `since` | string | No | Duration to look back (e.g., `5m`, `1h`) |
 
-Error categories: connection_errors, tls_errors, rate_limiting, misconfig, rbac_denied, upstream_issues, timeout, other_errors.
+**Error categories detected:** `connection_errors`, `tls_errors`, `rate_limiting`, `misconfig`, `rbac_denied`, `upstream_issues`, `timeout`, `other_errors`.
+
+**Example use cases:**
+
+- Quickly categorize errors in a misbehaving pod
+- Find TLS handshake failures in proxy logs
+- Detect rate limiting or RBAC denial patterns

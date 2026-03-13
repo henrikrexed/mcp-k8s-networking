@@ -26,14 +26,29 @@ When `OTEL_EXPORTER_OTLP_ENDPOINT` is not set, all telemetry signals use noop pr
 
 ## Traces
 
-Every MCP tool call produces a span following GenAI + MCP semantic conventions.
+The server produces three categories of spans that form a complete trace hierarchy:
 
-### Span Format
+```mermaid
+flowchart TD
+    A["execute_tool list_services"] --> B["k8s.api/list/services"]
+    A --> C["k8s.api/list/endpoints"]
+    D["execute_tool probe_connectivity"] --> E["probe/connectivity"]
+    E --> F["probe/deploy"]
+    F --> G["k8s.api/create/pods"]
+    E --> H["probe/wait"]
+    H --> I["k8s.api/list/pods (watch)"]
+    E --> J["probe/cleanup"]
+    J --> K["k8s.api/delete/pods"]
+```
+
+### MCP Tool Call Spans
+
+Every MCP tool call produces a span following GenAI + MCP semantic conventions.
 
 - **Span name**: `execute_tool {tool_name}` (e.g., `execute_tool list_services`)
 - **Span kind**: `SERVER`
 
-### Span Attributes
+**Attributes:**
 
 | Attribute | Description | Example |
 |-----------|-------------|---------|
@@ -46,6 +61,59 @@ Every MCP tool call produces a span following GenAI + MCP semantic conventions.
 | `mcp.session.id` | Agent session identifier | `sess_abc123` |
 | `error.type` | Error classification (on failure only) | `PROVIDER_NOT_FOUND` |
 
+### K8s API Call Spans
+
+Every Kubernetes API call made by the server automatically produces a child span via an instrumented HTTP transport wrapper on the K8s client.
+
+- **Span name**: `k8s.api/{verb}/{resource}` (e.g., `k8s.api/list/services`, `k8s.api/get/pods`)
+- **Span kind**: `CLIENT`
+
+**Attributes:**
+
+| Attribute | Description | Example |
+|-----------|-------------|---------|
+| `http.request.method` | HTTP method | `GET` |
+| `http.response.status_code` | HTTP response status | `200` |
+| `k8s.resource.kind` | Kubernetes resource type | `services` |
+| `k8s.api.verb` | K8s API verb | `list` |
+| `k8s.namespace` | Target namespace (if namespaced) | `default` |
+| `k8s.resource.name` | Resource name (if specific) | `my-service` |
+
+**Verb mapping:**
+
+| HTTP Method | With Name | Without Name |
+|-------------|-----------|-------------|
+| `GET` | `get` | `list` |
+| `POST` | — | `create` |
+| `PUT` | `update` | — |
+| `PATCH` | `patch` | — |
+| `DELETE` | `delete` | `deletecollection` |
+
+**Error handling:** Spans are marked ERROR on HTTP 4xx/5xx responses or transport failures.
+
+### Probe Lifecycle Spans
+
+Active probe operations (connectivity, DNS, HTTP) produce a parent span with child spans for each lifecycle phase.
+
+- **Parent span**: `probe/{probe_type}` (e.g., `probe/connectivity`, `probe/dns`, `probe/http`)
+- **Child spans**: `probe/deploy`, `probe/wait`, `probe/cleanup`
+- **Span kind**: `INTERNAL`
+
+**Parent span attributes:**
+
+| Attribute | Description | Example |
+|-----------|-------------|---------|
+| `probe.type` | Type of probe | `connectivity` |
+| `k8s.namespace` | Namespace where probe pod runs | `mcp-diagnostics` |
+| `probe.timeout` | Configured timeout | `10s` |
+| `k8s.pod.name` | Created probe pod name | `mcp-probe-connectivity-1710345600-1` |
+| `probe.success` | Whether the probe succeeded | `true` |
+| `probe.exit_code` | Probe container exit code | `0` |
+
+**Timeout handling:** When a probe times out, a `probe.timeout` span event is recorded on the parent span with the timeout duration, and the span status is set to ERROR.
+
+**Cleanup span:** The `probe/cleanup` span always runs, even after timeout, to track pod deletion.
+
 ### Context Propagation
 
 The server extracts W3C Trace Context (`traceparent`/`tracestate`) from `params._meta` in each MCP request. This enables **end-to-end traces** spanning:
@@ -53,9 +121,10 @@ The server extracts W3C Trace Context (`traceparent`/`tracestate`) from `params.
 ```mermaid
 flowchart LR
     Agent["AI Agent"] -->|traceparent| MCP["MCP Server"] -->|propagated ctx| K8s["K8s API"]
+    MCP -->|propagated ctx| Probe["Probe Pod"]
 ```
 
-If your AI agent sets `traceparent` in the `_meta` field of tool call requests, the MCP server will join those traces automatically.
+If your AI agent sets `traceparent` in the `_meta` field of tool call requests, the MCP server will join those traces automatically. Probe pods also receive the `TRACEPARENT` environment variable for correlation.
 
 ### Error Spans
 
@@ -98,6 +167,10 @@ rate(gen_ai_server_request_count{error_type!=""}[5m])
 ```promql
 rate(mcp_findings_total{severity="critical"}[5m])
 ```
+
+**Slowest K8s API calls (from trace data):**
+
+Use your tracing backend to query spans with name matching `k8s.api/*` and sort by duration to find slow API calls bottlenecking tool execution.
 
 ## Logs
 
@@ -246,95 +319,68 @@ otel:
   insecure: false
 ```
 
-## Complete MCP Tool Spans Reference
+## Complete Span Reference
 
-Every registered tool produces an `execute_tool` span when invoked. Below is the full list:
+Every registered tool produces an `execute_tool` span. K8s API calls within each tool produce `k8s.api/*` child spans. Probe tools additionally produce `probe/*` lifecycle spans.
 
-### Core K8s Tools (Always Available)
+### Always Available Tools
 
-| Tool | Span Name |
-|------|-----------|
-| `list_services` | `execute_tool list_services` |
-| `get_service` | `execute_tool get_service` |
-| `list_endpoints` | `execute_tool list_endpoints` |
-| `list_network_policies` | `execute_tool list_network_policies` |
-| `get_network_policy` | `execute_tool get_network_policy` |
-| `check_dns` | `execute_tool check_dns` |
-| `check_kube_proxy_health` | `execute_tool check_kube_proxy_health` |
-| `list_ingresses` | `execute_tool list_ingresses` |
-| `get_ingress` | `execute_tool get_ingress` |
+| Tool | Tool Span | Child Spans |
+|------|-----------|-------------|
+| `list_services` | `execute_tool list_services` | `k8s.api/list/services`, `k8s.api/list/endpoints` |
+| `get_service` | `execute_tool get_service` | `k8s.api/get/services`, `k8s.api/list/pods` |
+| `list_endpoints` | `execute_tool list_endpoints` | `k8s.api/list/endpoints` |
+| `list_networkpolicies` | `execute_tool list_networkpolicies` | `k8s.api/list/networkpolicies` |
+| `get_networkpolicy` | `execute_tool get_networkpolicy` | `k8s.api/get/networkpolicies` |
+| `check_dns_resolution` | `execute_tool check_dns_resolution` | `k8s.api/list/pods` |
+| `check_kube_proxy_health` | `execute_tool check_kube_proxy_health` | `k8s.api/list/daemonsets`, `k8s.api/list/pods` |
+| `list_ingresses` | `execute_tool list_ingresses` | `k8s.api/list/ingresses` |
+| `get_ingress` | `execute_tool get_ingress` | `k8s.api/get/ingresses` |
+| `check_dataplane_health` | `execute_tool check_dataplane_health` | `k8s.api/list/pods` |
+| `check_rate_limit_policies` | `execute_tool check_rate_limit_policies` | `k8s.api/list/*` (varies by provider) |
+| `get_proxy_logs` | `execute_tool get_proxy_logs` | `k8s.api/get/pods` |
+| `get_gateway_logs` | `execute_tool get_gateway_logs` | `k8s.api/list/pods` |
+| `get_infra_logs` | `execute_tool get_infra_logs` | `k8s.api/list/pods` |
+| `analyze_log_errors` | `execute_tool analyze_log_errors` | `k8s.api/get/pods` |
+| `probe_connectivity` | `execute_tool probe_connectivity` | `probe/connectivity` → `probe/deploy`, `probe/wait`, `probe/cleanup` |
+| `probe_dns` | `execute_tool probe_dns` | `probe/dns` → `probe/deploy`, `probe/wait`, `probe/cleanup` |
+| `probe_http` | `execute_tool probe_http` | `probe/http` → `probe/deploy`, `probe/wait`, `probe/cleanup` |
+| `list_skills` | `execute_tool list_skills` | — |
+| `run_skill` | `execute_tool run_skill` | varies by skill |
+| `suggest_remediation` | `execute_tool suggest_remediation` | `k8s.api/*` (varies) |
 
-### Log Tools (Always Available)
+### CRD-Dependent Tools
 
-| Tool | Span Name |
-|------|-----------|
-| `get_proxy_logs` | `execute_tool get_proxy_logs` |
-| `get_gateway_logs` | `execute_tool get_gateway_logs` |
-| `get_infra_logs` | `execute_tool get_infra_logs` |
-| `analyze_log_errors` | `execute_tool analyze_log_errors` |
-
-### Probe Tools (Always Available)
-
-| Tool | Span Name |
-|------|-----------|
-| `probe_connectivity` | `execute_tool probe_connectivity` |
-| `probe_dns` | `execute_tool probe_dns` |
-| `probe_http` | `execute_tool probe_http` |
-
-### Skill Tools (Always Available)
-
-| Tool | Span Name |
-|------|-----------|
-| `list_skills` | `execute_tool list_skills` |
-| `run_skill` | `execute_tool run_skill` |
-| `suggest_remediation` | `execute_tool suggest_remediation` |
-
-### Gateway API Tools (When Gateway API CRDs Detected)
-
-| Tool | Span Name |
-|------|-----------|
-| `list_gateways` | `execute_tool list_gateways` |
-| `get_gateway` | `execute_tool get_gateway` |
-| `list_httproutes` | `execute_tool list_httproutes` |
-| `get_httproute` | `execute_tool get_httproute` |
-| `list_grpcroutes` | `execute_tool list_grpcroutes` |
-| `get_grpcroute` | `execute_tool get_grpcroute` |
-| `list_referencegrants` | `execute_tool list_referencegrants` |
-| `get_referencegrant` | `execute_tool get_referencegrant` |
-| `scan_gateway_misconfigs` | `execute_tool scan_gateway_misconfigs` |
-| `check_gateway_conformance` | `execute_tool check_gateway_conformance` |
-| `design_gateway_api` | `execute_tool design_gateway_api` |
-
-### Istio Tools (When Istio CRDs Detected)
-
-| Tool | Span Name |
-|------|-----------|
-| `list_istio_resources` | `execute_tool list_istio_resources` |
-| `get_istio_resource` | `execute_tool get_istio_resource` |
-| `check_sidecar_injection` | `execute_tool check_sidecar_injection` |
-| `check_istio_mtls` | `execute_tool check_istio_mtls` |
-| `validate_istio_config` | `execute_tool validate_istio_config` |
-| `analyze_istio_authpolicy` | `execute_tool analyze_istio_authpolicy` |
-| `analyze_istio_routing` | `execute_tool analyze_istio_routing` |
-| `design_istio` | `execute_tool design_istio` |
-
-### kgateway Tools (When kgateway CRDs Detected)
-
-| Tool | Span Name |
-|------|-----------|
-| `list_kgateway_resources` | `execute_tool list_kgateway_resources` |
-| `validate_kgateway_resource` | `execute_tool validate_kgateway_resource` |
-| `check_kgateway_health` | `execute_tool check_kgateway_health` |
-| `design_kgateway` | `execute_tool design_kgateway` |
-
-### Tier 2 Provider Tools (When Respective CRDs Detected)
-
-| Tool | Span Name |
-|------|-----------|
-| `check_kuma_status` | `execute_tool check_kuma_status` |
-| `check_linkerd_status` | `execute_tool check_linkerd_status` |
-| `list_cilium_policies` | `execute_tool list_cilium_policies` |
-| `check_cilium_status` | `execute_tool check_cilium_status` |
-| `list_calico_policies` | `execute_tool list_calico_policies` |
-| `check_calico_status` | `execute_tool check_calico_status` |
-| `check_flannel_status` | `execute_tool check_flannel_status` |
+| Tool | Requires | Tool Span |
+|------|----------|-----------|
+| `list_gateways` | Gateway API | `execute_tool list_gateways` |
+| `get_gateway` | Gateway API | `execute_tool get_gateway` |
+| `list_httproutes` | Gateway API | `execute_tool list_httproutes` |
+| `get_httproute` | Gateway API | `execute_tool get_httproute` |
+| `list_grpcroutes` | Gateway API | `execute_tool list_grpcroutes` |
+| `get_grpcroute` | Gateway API | `execute_tool get_grpcroute` |
+| `list_referencegrants` | Gateway API | `execute_tool list_referencegrants` |
+| `get_referencegrant` | Gateway API | `execute_tool get_referencegrant` |
+| `scan_gateway_misconfigs` | Gateway API | `execute_tool scan_gateway_misconfigs` |
+| `check_gateway_conformance` | Gateway API | `execute_tool check_gateway_conformance` |
+| `design_gateway_api` | Gateway API | `execute_tool design_gateway_api` |
+| `list_istio_resources` | Istio | `execute_tool list_istio_resources` |
+| `get_istio_resource` | Istio | `execute_tool get_istio_resource` |
+| `check_sidecar_injection` | Istio | `execute_tool check_sidecar_injection` |
+| `check_istio_mtls` | Istio | `execute_tool check_istio_mtls` |
+| `validate_istio_config` | Istio | `execute_tool validate_istio_config` |
+| `analyze_istio_authpolicy` | Istio | `execute_tool analyze_istio_authpolicy` |
+| `analyze_istio_routing` | Istio | `execute_tool analyze_istio_routing` |
+| `design_istio` | Istio | `execute_tool design_istio` |
+| `list_kgateway_resources` | kgateway | `execute_tool list_kgateway_resources` |
+| `validate_kgateway_resource` | kgateway | `execute_tool validate_kgateway_resource` |
+| `check_kgateway_health` | kgateway | `execute_tool check_kgateway_health` |
+| `design_kgateway` | kgateway | `execute_tool design_kgateway` |
+| `check_kuma_status` | Kuma | `execute_tool check_kuma_status` |
+| `check_linkerd_status` | Linkerd | `execute_tool check_linkerd_status` |
+| `list_cilium_policies` | Cilium | `execute_tool list_cilium_policies` |
+| `get_cilium_policy` | Cilium | `execute_tool get_cilium_policy` |
+| `check_cilium_status` | Cilium | `execute_tool check_cilium_status` |
+| `list_calico_policies` | Calico | `execute_tool list_calico_policies` |
+| `check_calico_status` | Calico | `execute_tool check_calico_status` |
+| `check_flannel_status` | Flannel | `execute_tool check_flannel_status` |

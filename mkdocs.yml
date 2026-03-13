@@ -44,6 +44,7 @@ nav:
     - Active Probing: tools/probing.md
     - Design Guidance: tools/design-guidance.md
     - Agent Skills: tools/skills.md
+  - Response Format: response-format.md
   - Architecture: architecture.md
   - Contributing: contributing.md
 
