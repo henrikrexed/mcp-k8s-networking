@@ -159,12 +159,12 @@ development_status:
   # ============================================================
   # Epic 12: OpenTelemetry Instrumentation (GenAI + MCP Semconv)
   # ============================================================
-  epic-12: in-progress
+  epic-12: done
   12-1-full-telemetry-package-tracer-meter-logger-providers: done
   12-2-mcp-tool-call-instrumentation-middleware-genai-mcp-semconv: done
   12-3-context-propagation-extract-from-params-meta: done
   12-4-custom-domain-metrics-findings-errors: done
   12-5-slog-otel-log-bridge-with-trace-correlation: done
-  12-6-k8s-api-call-spans: backlog
-  12-7-probe-lifecycle-spans: backlog
+  12-6-k8s-api-call-spans: done
+  12-7-probe-lifecycle-spans: done
   epic-12-retrospective: optional
