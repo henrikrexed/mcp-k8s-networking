@@ -32,6 +32,9 @@ func NewClients() (*Clients, error) {
 		}
 	}
 
+	// Wrap transport with OTel tracing for K8s API call spans.
+	config.Wrap(newTracingTransport)
+
 	dynClient, err := dynamic.NewForConfig(config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create dynamic client: %w", err)
