@@ -23,8 +23,8 @@ A Model Context Protocol (MCP) server for Kubernetes networking diagnostics — 
 ### Helm (recommended)
 
 ```bash
-helm repo add henrikrexed https://henrikrexed.github.io/mcp-k8s-networking
-helm install mcp-k8s-networking henrikrexed/mcp-k8s-networking \
+# Install directly from OCI registry (no helm repo add needed)
+helm install mcp-k8s-networking oci://ghcr.io/henrikrexed/mcp-k8s-networking --version 0.1.0 \
   --namespace tools --create-namespace
 ```
 
