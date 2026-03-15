@@ -33,7 +33,7 @@ mcp-k8s-networking is a diagnostic server that AI agents connect to via the MCP 
 
 ```bash
 # Deploy with Helm
-helm install mcp-k8s-networking oci://ghcr.io/henrikrexed/mcp-k8s-networking --version 0.1.0 \
+helm install mcp-k8s-networking oci://ghcr.io/henrikrexed/mcp-k8s-networking --version 0.0.14 \
   --namespace mcp-k8s-networking --create-namespace \
   --set config.clusterName=my-cluster
 

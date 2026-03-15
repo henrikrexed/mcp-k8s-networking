@@ -11,7 +11,7 @@
 ### Option 1: Helm Chart
 
 ```bash
-helm install mcp-k8s-networking oci://ghcr.io/henrikrexed/mcp-k8s-networking --version 0.1.0 \
+helm install mcp-k8s-networking oci://ghcr.io/henrikrexed/mcp-k8s-networking --version 0.0.14 \
   --namespace mcp-k8s-networking \
   --create-namespace \
   --set config.clusterName=my-cluster
@@ -20,7 +20,7 @@ helm install mcp-k8s-networking oci://ghcr.io/henrikrexed/mcp-k8s-networking --v
 Common overrides:
 
 ```bash
-helm install mcp-k8s-networking oci://ghcr.io/henrikrexed/mcp-k8s-networking --version 0.1.0 \
+helm install mcp-k8s-networking oci://ghcr.io/henrikrexed/mcp-k8s-networking --version 0.0.14 \
   --namespace mcp-k8s-networking \
   --create-namespace \
   --set config.clusterName=my-cluster \
@@ -43,7 +43,7 @@ kubectl apply -f deploy/manifests/install.yaml
 To expose the MCP server through a Gateway API HTTPRoute:
 
 ```bash
-helm install mcp-k8s-networking oci://ghcr.io/henrikrexed/mcp-k8s-networking --version 0.1.0 \
+helm install mcp-k8s-networking oci://ghcr.io/henrikrexed/mcp-k8s-networking --version 0.0.14 \
   --namespace mcp-k8s-networking \
   --create-namespace \
   --set config.clusterName=my-cluster \
@@ -95,7 +95,7 @@ otel:
 Or on the command line:
 
 ```bash
-helm install mcp-k8s-networking oci://ghcr.io/henrikrexed/mcp-k8s-networking --version 0.1.0 \
+helm install mcp-k8s-networking oci://ghcr.io/henrikrexed/mcp-k8s-networking --version 0.0.14 \
   --namespace mcp-k8s-networking \
   --create-namespace \
   --set config.clusterName=my-cluster \
